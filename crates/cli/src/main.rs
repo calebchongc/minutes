@@ -9,7 +9,7 @@ use minutes_core::autoresearch::{
     DecodeHintEvalComparisonRequest, DecodeHintEvalOptions, DecodeHintEvalRequest,
 };
 use minutes_core::capture::RecordingIntent;
-use minutes_core::config::{ConsentMode, VALID_PARAKEET_MODELS};
+use minutes_core::config::{ConsentMode, DEFAULT_MLX_AUDIO_MODEL, VALID_PARAKEET_MODELS};
 use minutes_core::markdown::ConsentBasis;
 use minutes_core::parakeet;
 use minutes_core::{CaptureMode, Config, ContentType};
@@ -771,6 +771,14 @@ enum Commands {
         /// Parakeet model to download: tdt-ctc-110m, tdt-600m
         #[arg(long, default_value = "tdt-600m")]
         parakeet_model: String,
+
+        /// Create/use a local Python environment for MLX Audio and select it as the transcription engine
+        #[arg(long)]
+        mlx_audio: bool,
+
+        /// MLX Audio model id/path to configure
+        #[arg(long, default_value = DEFAULT_MLX_AUDIO_MODEL)]
+        mlx_audio_model: String,
 
         /// Install the bundled 5-meeting fixture corpus for demoing search, graph, and MCP flows
         #[arg(long)]
@@ -1687,10 +1695,14 @@ fn main() -> Result<()> {
             diarization,
             parakeet,
             parakeet_model,
+            mlx_audio,
+            mlx_audio_model,
             demo,
         } => {
             if demo {
                 cmd_setup_demo()
+            } else if mlx_audio {
+                cmd_setup_mlx_audio(&mlx_audio_model)
             } else if parakeet {
                 cmd_setup_parakeet(&parakeet_model)
             } else {
@@ -5454,6 +5466,20 @@ fn cmd_setup_demo() -> Result<()> {
     Ok(())
 }
 
+const MLX_AUDIO_SETUP_VENV_ENV: &str = "MINUTES_MLX_AUDIO_SETUP_VENV";
+const MLX_AUDIO_SETUP_PYTHON_ENV: &str = "MINUTES_MLX_AUDIO_SETUP_PYTHON";
+const MLX_AUDIO_MIN_PYTHON_MAJOR: u32 = 3;
+const MLX_AUDIO_MIN_PYTHON_MINOR: u32 = 9;
+
+const MLX_AUDIO_READY_CHECK: &str = r#"
+import sys
+from mlx_audio.stt.utils import load
+
+model_id = sys.argv[1]
+load(model_id)
+print(f"mlx-audio ready: {model_id}")
+"#;
+
 fn cmd_setup_diarization() -> Result<()> {
     use minutes_core::diarize;
 
@@ -5505,6 +5531,307 @@ fn cmd_setup_diarization() -> Result<()> {
     eprintln!("  # embedding_model = \"cam++-lm\"  # or \"cam++\" for the lighter original");
 
     Ok(())
+}
+
+/// Set up a local Python environment for MLX Audio and select it as the
+/// saved-audio transcription backend.
+fn cmd_setup_mlx_audio(model: &str) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        anyhow::bail!("mlx-audio model id/path cannot be empty");
+    }
+
+    let venv_dir = mlx_audio_setup_venv_dir();
+    let venv_python = mlx_audio_venv_python(&venv_dir);
+    let bootstrap_python =
+        std::env::var(MLX_AUDIO_SETUP_PYTHON_ENV).unwrap_or_else(|_| "python3".into());
+
+    check_mlx_audio_bootstrap_python(&bootstrap_python)?;
+
+    if !venv_python.exists() {
+        eprintln!(
+            "Creating MLX Audio Python environment: {}",
+            venv_dir.display()
+        );
+        let repair_hint = if venv_dir.exists() {
+            mlx_audio_incomplete_venv_hint(&venv_dir)
+        } else {
+            mlx_audio_python_install_hint()
+        };
+        run_setup_command(
+            &bootstrap_python,
+            &["-m", "venv", venv_dir.to_string_lossy().as_ref()],
+            "create MLX Audio Python environment",
+            &repair_hint,
+        )?;
+    } else {
+        eprintln!(
+            "Using existing MLX Audio Python environment: {}",
+            venv_dir.display()
+        );
+    }
+
+    eprintln!("Installing/updating mlx-audio...");
+    run_setup_command(
+        &venv_python,
+        &["-m", "pip", "install", "-U", "pip"],
+        "upgrade pip in MLX Audio environment",
+        &mlx_audio_package_install_hint(&venv_dir, &venv_python),
+    )?;
+    run_setup_command(
+        &venv_python,
+        &["-m", "pip", "install", "-U", "mlx-audio"],
+        "install mlx-audio",
+        &mlx_audio_package_install_hint(&venv_dir, &venv_python),
+    )?;
+
+    eprintln!("Checking MLX Audio model readiness: {}", model);
+    run_setup_command(
+        &venv_python,
+        &["-c", MLX_AUDIO_READY_CHECK, model],
+        "load MLX Audio model",
+        &mlx_audio_model_readiness_hint(model),
+    )?;
+
+    let mut config = Config::load();
+    config.transcription.engine = "mlx-audio".into();
+    config.transcription.mlx_audio_model = model.into();
+    config.transcription.mlx_audio_python = venv_python.display().to_string();
+    config.transcription.mlx_audio_warm = true;
+    config
+        .save()
+        .map_err(|e| anyhow::anyhow!("failed to save config: {}", e))?;
+
+    eprintln!();
+    eprintln!("MLX Audio configured for saved-audio transcription.");
+    eprintln!("  Config: {}", Config::config_path().display());
+    eprintln!("  Python: {}", venv_python.display());
+    eprintln!("  Model:  {}", model);
+    eprintln!();
+    eprintln!("Desktop users can use Advanced > Open config to review these settings.");
+
+    Ok(())
+}
+
+fn mlx_audio_setup_venv_dir() -> PathBuf {
+    std::env::var_os(MLX_AUDIO_SETUP_VENV_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Config::minutes_dir().join("mlx-audio"))
+}
+
+fn mlx_audio_venv_python(venv_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python")
+    }
+}
+
+fn check_mlx_audio_bootstrap_python(bootstrap_python: &str) -> Result<()> {
+    let output = run_setup_command_output(
+        bootstrap_python,
+        &["--version"],
+        "check Python",
+        &mlx_audio_python_install_hint(),
+    )?;
+    let version_text = setup_command_output_text(&output);
+    let Some((major, minor, patch)) = parse_python_version(&version_text) else {
+        anyhow::bail!(
+            "MLX Audio setup could not read the Python version.\n\nFix: {}\n\nDetails: expected output like `Python 3.11`, got: {}",
+            mlx_audio_python_install_hint(),
+            if version_text.trim().is_empty() {
+                "(no output)".into()
+            } else {
+                truncate_setup_detail(version_text.trim())
+            }
+        );
+    };
+
+    if (major, minor) < (MLX_AUDIO_MIN_PYTHON_MAJOR, MLX_AUDIO_MIN_PYTHON_MINOR) {
+        anyhow::bail!(
+            "MLX Audio setup found Python {major}.{minor}.{patch}, but needs Python {MLX_AUDIO_MIN_PYTHON_MAJOR}.{MLX_AUDIO_MIN_PYTHON_MINOR} or newer.\n\nFix: {}",
+            mlx_audio_python_install_hint()
+        );
+    }
+
+    Ok(())
+}
+
+fn parse_python_version(text: &str) -> Option<(u32, u32, u32)> {
+    text.lines().find_map(|line| {
+        let version = line.trim().strip_prefix("Python ")?;
+        let mut parts = version.split_whitespace().next()?.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts
+            .next()
+            .and_then(|part| {
+                part.chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0);
+        Some((major, minor, patch))
+    })
+}
+
+fn mlx_audio_python_install_hint() -> String {
+    format!(
+        "Install Python {MLX_AUDIO_MIN_PYTHON_MAJOR}.{MLX_AUDIO_MIN_PYTHON_MINOR} or newer, then rerun `minutes setup --mlx-audio`. On macOS, `brew install python` is usually enough. To use a specific Python, set {MLX_AUDIO_SETUP_PYTHON_ENV}=/path/to/python3."
+    )
+}
+
+fn mlx_audio_incomplete_venv_hint(venv_dir: &Path) -> String {
+    format!(
+        "The MLX Audio environment at {} looks incomplete. Delete that directory, then rerun `minutes setup --mlx-audio`.",
+        venv_dir.display()
+    )
+}
+
+fn mlx_audio_package_install_hint(venv_dir: &Path, venv_python: &Path) -> String {
+    format!(
+        "The MLX Audio environment at {} could not install packages. Delete that directory and rerun setup, or run `{} -m pip install -U pip mlx-audio` to see pip's full output.",
+        venv_dir.display(),
+        venv_python.display()
+    )
+}
+
+fn mlx_audio_model_readiness_hint(model: &str) -> String {
+    format!(
+        "Check that `{model}` is a valid MLX Audio model id/path and that mlx-audio supports it, then rerun `minutes setup --mlx-audio --mlx-audio-model <id>`."
+    )
+}
+
+fn run_setup_command<P>(
+    program: P,
+    args: &[&str],
+    description: &str,
+    recovery_hint: &str,
+) -> Result<()>
+where
+    P: AsRef<std::ffi::OsStr>,
+{
+    run_setup_command_output(program, args, description, recovery_hint).map(|_| ())
+}
+
+fn run_setup_command_output<P>(
+    program: P,
+    args: &[&str],
+    description: &str,
+    recovery_hint: &str,
+) -> Result<std::process::Output>
+where
+    P: AsRef<std::ffi::OsStr>,
+{
+    let program = program.as_ref();
+    let command_label = setup_command_label(program, args);
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "MLX Audio setup could not {description}.\n\nFix: {recovery_hint}\n\nDetails: failed to start `{command_label}`: {error}"
+            )
+        })?;
+
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let status = output
+        .status
+        .code()
+        .map(|code| format!("exit code {code}"))
+        .unwrap_or_else(|| "terminated by signal".into());
+    let output_text = sanitize_setup_output(&setup_command_output_text(&output));
+    let detail = if output_text.trim().is_empty() {
+        status
+    } else {
+        format!("{status}; {}", truncate_setup_detail(output_text.trim()))
+    };
+    anyhow::bail!(
+        "MLX Audio setup could not {description}.\n\nFix: {recovery_hint}\n\nDetails: `{command_label}` failed with {detail}"
+    );
+}
+
+fn setup_command_label(program: &std::ffi::OsStr, args: &[&str]) -> String {
+    let mut parts = vec![program.to_string_lossy().into_owned()];
+    let mut redact_inline_python = false;
+    for arg in args {
+        if redact_inline_python {
+            parts.push("<inline-python>".into());
+            redact_inline_python = false;
+            continue;
+        }
+        parts.push(if *arg == "-c" {
+            redact_inline_python = true;
+            "-c".into()
+        } else if arg.contains('\n') || arg.chars().count() > 120 {
+            "<long-arg>".into()
+        } else {
+            arg.to_string()
+        });
+    }
+    parts.join(" ")
+}
+
+fn setup_command_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stderr}\n{stdout}"),
+    }
+}
+
+fn sanitize_setup_output(text: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_traceback = false;
+    let mut saw_traceback = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Traceback (most recent call last):") {
+            in_traceback = true;
+            saw_traceback = true;
+            continue;
+        }
+
+        if in_traceback {
+            if trimmed.is_empty()
+                || trimmed.starts_with("File ")
+                || trimmed.starts_with("raise ")
+                || line.starts_with(char::is_whitespace)
+            {
+                continue;
+            }
+            in_traceback = false;
+        }
+
+        if !trimmed.is_empty() {
+            lines.push(trimmed.to_string());
+        }
+    }
+
+    if lines.is_empty() && saw_traceback {
+        "Python exited with an internal error before printing a concise message.".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn truncate_setup_detail(detail: &str) -> String {
+    const MAX_CHARS: usize = 1200;
+    if detail.chars().count() <= MAX_CHARS {
+        return detail.to_string();
+    }
+    let mut truncated = detail.chars().take(MAX_CHARS).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 /// Set up a parakeet.cpp model for alternative transcription.
@@ -6460,6 +6787,7 @@ mod tests {
         DecodeHintEvalReport, DecodeHintEvalTotals, DecodeHintEvalTranscriptMetrics,
     };
     use serde_json::json;
+    use std::ffi::{OsStr, OsString};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -6505,6 +6833,372 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).ok();
         result
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn setup_clap_accepts_mlx_audio_flags() {
+        let parsed = Cli::try_parse_from([
+            "minutes",
+            "setup",
+            "--mlx-audio",
+            "--mlx-audio-model",
+            "local/qwen3-asr",
+        ])
+        .expect("setup --mlx-audio must parse");
+
+        match parsed.command {
+            Commands::Setup {
+                mlx_audio,
+                mlx_audio_model,
+                parakeet,
+                ..
+            } => {
+                assert!(mlx_audio);
+                assert!(!parakeet);
+                assert_eq!(mlx_audio_model, "local/qwen3-asr");
+            }
+            _ => panic!("expected setup command"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_mlx_audio_saves_config_and_runs_fake_python() {
+        with_temp_home(|home| {
+            let fake_python = home.join("fake-python.py");
+            let fake_log = home.join("fake-python.log");
+            write_executable(
+                &fake_python,
+                r#"#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("Python 3.11.0")
+    sys.exit(0)
+
+log_path = pathlib.Path(os.environ["MINUTES_FAKE_PYTHON_LOG"])
+with log_path.open("a", encoding="utf-8") as log:
+    log.write(repr(sys.argv[1:]) + "\n")
+
+if sys.argv[1:3] == ["-m", "venv"]:
+    venv = pathlib.Path(sys.argv[3])
+    child_python = venv / "bin" / "python"
+    child_python.parent.mkdir(parents=True, exist_ok=True)
+    child_python.write_text(pathlib.Path(__file__).read_text(), encoding="utf-8")
+    child_python.chmod(0o755)
+    sys.exit(0)
+
+if len(sys.argv) >= 3 and sys.argv[1:3] == ["-m", "pip"]:
+    sys.exit(0)
+
+if len(sys.argv) >= 4 and sys.argv[1] == "-c":
+    assert sys.argv[3] == "local/qwen3-asr"
+    print("mlx-audio ready")
+    sys.exit(0)
+
+print("unexpected fake-python argv", sys.argv, file=sys.stderr)
+sys.exit(2)
+"#,
+            );
+
+            let xdg_config = home.join("xdg-config");
+            let venv_dir = home.join("mlx-audio-env");
+            let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &xdg_config);
+            let _venv = EnvVarGuard::set(MLX_AUDIO_SETUP_VENV_ENV, &venv_dir);
+            let _python = EnvVarGuard::set(MLX_AUDIO_SETUP_PYTHON_ENV, &fake_python);
+            let _fake_log = EnvVarGuard::set("MINUTES_FAKE_PYTHON_LOG", &fake_log);
+
+            cmd_setup_mlx_audio("local/qwen3-asr").unwrap();
+
+            let config = Config::load();
+            assert_eq!(config.transcription.engine, "mlx-audio");
+            assert_eq!(config.transcription.mlx_audio_model, "local/qwen3-asr");
+            assert_eq!(
+                config.transcription.mlx_audio_python,
+                venv_dir.join("bin").join("python").display().to_string()
+            );
+            assert!(config.transcription.mlx_audio_warm);
+
+            let log = std::fs::read_to_string(fake_log).unwrap();
+            assert!(log.contains(r#"['-m', 'venv',"#), "{log}");
+            assert!(
+                log.contains(r#"['-m', 'pip', 'install', '-U', 'pip']"#),
+                "{log}"
+            );
+            assert!(
+                log.contains(r#"['-m', 'pip', 'install', '-U', 'mlx-audio']"#),
+                "{log}"
+            );
+            assert!(log.contains("'local/qwen3-asr'"), "{log}");
+        });
+    }
+
+    #[test]
+    fn setup_mlx_audio_missing_python_has_actionable_error() {
+        with_temp_home(|home| {
+            let missing_python = home.join("does-not-exist-python3");
+            let venv_dir = home.join("mlx-audio-env");
+            let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", home.join("xdg-config"));
+            let _venv = EnvVarGuard::set(MLX_AUDIO_SETUP_VENV_ENV, &venv_dir);
+            let _python = EnvVarGuard::set(MLX_AUDIO_SETUP_PYTHON_ENV, &missing_python);
+
+            let err = cmd_setup_mlx_audio("local/qwen3-asr").expect_err("missing python fails");
+            let message = err.to_string();
+
+            assert!(message.contains("could not check Python"), "{message}");
+            assert!(message.contains("Install Python 3.9 or newer"), "{message}");
+            assert!(message.contains(MLX_AUDIO_SETUP_PYTHON_ENV), "{message}");
+            assert!(!message.contains("Traceback"), "{message}");
+            assert!(!Config::config_path().exists());
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_mlx_audio_ancient_python_stops_before_venv() {
+        with_temp_home(|home| {
+            let fake_python = home.join("fake-old-python.py");
+            let fake_log = home.join("fake-old-python.log");
+            write_executable(
+                &fake_python,
+                r#"#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+pathlib.Path(os.environ["MINUTES_FAKE_PYTHON_LOG"]).write_text(repr(sys.argv[1:]), encoding="utf-8")
+if sys.argv[1:] == ["--version"]:
+    print("Python 3.8.18")
+    sys.exit(0)
+sys.exit(2)
+"#,
+            );
+            let venv_dir = home.join("mlx-audio-env");
+            let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", home.join("xdg-config"));
+            let _venv = EnvVarGuard::set(MLX_AUDIO_SETUP_VENV_ENV, &venv_dir);
+            let _python = EnvVarGuard::set(MLX_AUDIO_SETUP_PYTHON_ENV, &fake_python);
+            let _fake_log = EnvVarGuard::set("MINUTES_FAKE_PYTHON_LOG", &fake_log);
+
+            let err = cmd_setup_mlx_audio("local/qwen3-asr").expect_err("old python fails");
+            let message = err.to_string();
+
+            assert!(message.contains("found Python 3.8.18"), "{message}");
+            assert!(message.contains("needs Python 3.9 or newer"), "{message}");
+            assert_eq!(
+                std::fs::read_to_string(fake_log).unwrap(),
+                r#"['--version']"#
+            );
+            assert!(!venv_dir.exists());
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_mlx_audio_half_created_venv_error_says_delete_it() {
+        with_temp_home(|home| {
+            let fake_python = home.join("fake-venv-failure-python.py");
+            write_executable(
+                &fake_python,
+                r#"#!/usr/bin/env python3
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("Python 3.11.0")
+    sys.exit(0)
+
+if sys.argv[1:3] == ["-m", "venv"]:
+    print("Traceback (most recent call last):", file=sys.stderr)
+    print("  File \"/tmp/venv.py\", line 1, in <module>", file=sys.stderr)
+    print("RuntimeError: ensurepip failed", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(2)
+"#,
+            );
+            let venv_dir = home.join("mlx-audio-env");
+            std::fs::create_dir_all(&venv_dir).unwrap();
+            let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", home.join("xdg-config"));
+            let _venv = EnvVarGuard::set(MLX_AUDIO_SETUP_VENV_ENV, &venv_dir);
+            let _python = EnvVarGuard::set(MLX_AUDIO_SETUP_PYTHON_ENV, &fake_python);
+
+            let err = cmd_setup_mlx_audio("local/qwen3-asr").expect_err("venv failure fails");
+            let message = err.to_string();
+
+            assert!(
+                message.contains("could not create MLX Audio Python environment"),
+                "{message}"
+            );
+            assert!(message.contains("looks incomplete"), "{message}");
+            assert!(message.contains("Delete that directory"), "{message}");
+            assert!(
+                message.contains("RuntimeError: ensurepip failed"),
+                "{message}"
+            );
+            assert!(!message.contains("Traceback"), "{message}");
+            assert!(!message.contains("File \"/tmp/venv.py\""), "{message}");
+            assert!(!Config::config_path().exists());
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_mlx_audio_pip_failure_has_fix_without_traceback() {
+        with_temp_home(|home| {
+            let fake_python = home.join("fake-pip-failure-python.py");
+            write_executable(
+                &fake_python,
+                r#"#!/usr/bin/env python3
+import pathlib
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("Python 3.11.0")
+    sys.exit(0)
+
+if sys.argv[1:3] == ["-m", "venv"]:
+    venv = pathlib.Path(sys.argv[3])
+    child_python = venv / "bin" / "python"
+    child_python.parent.mkdir(parents=True, exist_ok=True)
+    child_python.write_text(pathlib.Path(__file__).read_text(), encoding="utf-8")
+    child_python.chmod(0o755)
+    sys.exit(0)
+
+if sys.argv[1:3] == ["-m", "pip"] and sys.argv[-1] == "pip":
+    sys.exit(0)
+
+if sys.argv[1:3] == ["-m", "pip"] and sys.argv[-1] == "mlx-audio":
+    print("Traceback (most recent call last):", file=sys.stderr)
+    print("  File \"/tmp/pip.py\", line 1, in <module>", file=sys.stderr)
+    print("ERROR: No matching distribution found for mlx-audio", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(2)
+"#,
+            );
+            let venv_dir = home.join("mlx-audio-env");
+            let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", home.join("xdg-config"));
+            let _venv = EnvVarGuard::set(MLX_AUDIO_SETUP_VENV_ENV, &venv_dir);
+            let _python = EnvVarGuard::set(MLX_AUDIO_SETUP_PYTHON_ENV, &fake_python);
+
+            let err = cmd_setup_mlx_audio("local/qwen3-asr").expect_err("pip failure fails");
+            let message = err.to_string();
+
+            assert!(message.contains("could not install mlx-audio"), "{message}");
+            assert!(message.contains("could not install packages"), "{message}");
+            assert!(
+                message.contains("-m pip install -U pip mlx-audio"),
+                "{message}"
+            );
+            assert!(
+                message.contains("ERROR: No matching distribution found for mlx-audio"),
+                "{message}"
+            );
+            assert!(!message.contains("Traceback"), "{message}");
+            assert!(!message.contains("File \"/tmp/pip.py\""), "{message}");
+            assert!(!Config::config_path().exists());
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_mlx_audio_readiness_failure_has_model_fix_without_traceback() {
+        with_temp_home(|home| {
+            let fake_python = home.join("fake-readiness-failure-python.py");
+            write_executable(
+                &fake_python,
+                r#"#!/usr/bin/env python3
+import pathlib
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("Python 3.11.0")
+    sys.exit(0)
+
+if sys.argv[1:3] == ["-m", "venv"]:
+    venv = pathlib.Path(sys.argv[3])
+    child_python = venv / "bin" / "python"
+    child_python.parent.mkdir(parents=True, exist_ok=True)
+    child_python.write_text(pathlib.Path(__file__).read_text(), encoding="utf-8")
+    child_python.chmod(0o755)
+    sys.exit(0)
+
+if sys.argv[1:3] == ["-m", "pip"]:
+    sys.exit(0)
+
+if len(sys.argv) >= 4 and sys.argv[1] == "-c":
+    print("Traceback (most recent call last):", file=sys.stderr)
+    print("  File \"/tmp/mlx.py\", line 1, in <module>", file=sys.stderr)
+    print("ValueError: unknown model local/qwen3-asr", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(2)
+"#,
+            );
+            let venv_dir = home.join("mlx-audio-env");
+            let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", home.join("xdg-config"));
+            let _venv = EnvVarGuard::set(MLX_AUDIO_SETUP_VENV_ENV, &venv_dir);
+            let _python = EnvVarGuard::set(MLX_AUDIO_SETUP_PYTHON_ENV, &fake_python);
+
+            let err = cmd_setup_mlx_audio("local/qwen3-asr").expect_err("readiness failure fails");
+            let message = err.to_string();
+
+            assert!(
+                message.contains("could not load MLX Audio model"),
+                "{message}"
+            );
+            assert!(
+                message.contains("valid MLX Audio model id/path"),
+                "{message}"
+            );
+            assert!(message.contains("--mlx-audio-model <id>"), "{message}");
+            assert!(
+                message.contains("ValueError: unknown model local/qwen3-asr"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("from mlx_audio.stt.utils import load"),
+                "{message}"
+            );
+            assert!(message.contains("-c <inline-python>"), "{message}");
+            assert!(!message.contains("Traceback"), "{message}");
+            assert!(!message.contains("File \"/tmp/mlx.py\""), "{message}");
+            assert!(!Config::config_path().exists());
+        });
     }
 
     #[test]
