@@ -715,6 +715,7 @@ pub struct LiveTranscriptConfig {
     /// - `"inherit"` (default): follow `transcription.engine`
     /// - `"whisper"`: force Whisper for standalone live transcript
     /// - `"parakeet"`: force Parakeet for standalone live transcript
+    /// - `"mlx-audio"`: force MLX Audio for final utterances
     /// - `"apple-speech"`: experimental macOS standalone-live-only path
     pub backend: String,
     /// Whisper model to use for live transcription.
@@ -748,6 +749,7 @@ pub const VALID_LIVE_TRANSCRIPT_BACKENDS: &[&str] = &[
     LIVE_TRANSCRIPT_BACKEND_INHERIT,
     "whisper",
     "parakeet",
+    "mlx-audio",
     "apple-speech",
 ];
 
@@ -1699,6 +1701,37 @@ backend = "apple-speech"
     }
 
     #[test]
+    fn mlx_audio_live_transcript_backend_can_be_set_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transcription]
+engine = "whisper"
+
+[live_transcript]
+backend = "mlx-audio"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert_eq!(config.live_transcript.backend, "mlx-audio");
+        assert_eq!(config.effective_live_transcript_backend(), "mlx-audio");
+        assert_eq!(config.transcription.engine, "whisper");
+    }
+
+    #[test]
+    fn effective_live_transcript_backend_can_inherit_mlx_audio() {
+        let mut config = Config::default();
+        config.transcription.engine = "mlx-audio".into();
+
+        assert_eq!(config.standalone_live_backend_setting(), "inherit");
+        assert_eq!(config.effective_live_transcript_backend(), "mlx-audio");
+    }
+
+    #[test]
     fn parakeet_sidecar_flag_can_be_enabled_from_toml() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -1782,6 +1815,24 @@ backend = "parakeet"
 
         let config = Config::load_from(&config_path);
         assert_eq!(config.dictation.backend, "parakeet");
+        assert_eq!(config.transcription.engine, "whisper");
+    }
+
+    #[test]
+    fn dictation_backend_accepts_mlx_audio_without_changing_batch_engine() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[dictation]
+backend = "mlx-audio"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert_eq!(config.dictation.backend, "mlx-audio");
         assert_eq!(config.transcription.engine, "whisper");
     }
 

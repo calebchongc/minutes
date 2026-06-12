@@ -203,11 +203,12 @@ enum DictationFinalBackend {
     Whisper,
     AppleSpeech,
     Parakeet,
+    MlxAudio,
 }
 
 impl DictationFinalBackend {
     fn needs_utterance_samples(self) -> bool {
-        matches!(self, Self::AppleSpeech | Self::Parakeet)
+        matches!(self, Self::AppleSpeech | Self::Parakeet | Self::MlxAudio)
     }
 }
 
@@ -609,6 +610,7 @@ fn dictation_final_backend(config: &Config) -> DictationFinalBackend {
                 DictationFinalBackend::Whisper
             }
         }
+        "mlx-audio" => DictationFinalBackend::MlxAudio,
         "whisper" => DictationFinalBackend::Whisper,
         other => {
             tracing::warn!(
@@ -701,6 +703,23 @@ fn finalize_dictation_transcription(
         }
     }
 
+    if _final_backend == DictationFinalBackend::MlxAudio {
+        match transcribe_utterance_with_mlx_audio(_final_utterance_samples, _config) {
+            Ok(Some(result)) => return Some(result),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "[minutes] mlx-audio dictation failed; using whisper final text for this utterance (detail: {})",
+                    error
+                );
+                tracing::warn!(
+                    error = %error,
+                    "mlx-audio dictation failed; using whisper fallback for this utterance"
+                );
+            }
+        }
+    }
+
     streaming.finalize(whisper_ctx)
 }
 
@@ -778,7 +797,27 @@ fn transcribe_utterance_with_parakeet(
     }
 }
 
-#[cfg(any(test, feature = "parakeet"))]
+fn transcribe_utterance_with_mlx_audio(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<StreamingResult>, MinutesError> {
+    match crate::mlx_audio::transcribe_utterance(samples, config) {
+        Ok(Some(result)) => {
+            let Some(text) = normalize_final_dictation_text(&result.text) else {
+                return Ok(None);
+            };
+            Ok(Some(StreamingResult {
+                text,
+                is_final: true,
+                duration_secs: result.duration_secs,
+            }))
+        }
+        Ok(None) => Ok(None),
+        Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn normalize_final_dictation_text(text: &str) -> Option<String> {
     let text = text
         .lines()
@@ -791,7 +830,6 @@ fn normalize_final_dictation_text(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.trim().to_string())
 }
 
-#[cfg(any(test, feature = "parakeet"))]
 fn dictation_text_part(line: &str) -> &str {
     line.find("] ")
         .map(|index| &line[index + 2..])
@@ -1239,6 +1277,8 @@ fn num_cpus() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn test_config(root: &std::path::Path) -> Config {
@@ -1295,6 +1335,59 @@ mod tests {
     #[test]
     fn normalize_final_dictation_text_rejects_empty_timestamped_lines() {
         assert_eq!(normalize_final_dictation_text("[0:00] \n\n"), None);
+    }
+
+    #[test]
+    fn dictation_final_backend_selects_mlx_audio() {
+        let mut config = Config::default();
+        config.dictation.backend = "mlx-audio".into();
+
+        assert_eq!(
+            dictation_final_backend(&config),
+            DictationFinalBackend::MlxAudio
+        );
+        assert!(dictation_final_backend(&config).needs_utterance_samples());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mlx_audio_dictation_accepts_text_only_helper_output() {
+        let dir = TempDir::new().unwrap();
+        let helper = dir.path().join("fake-mlx-helper.py");
+        std::fs::write(
+            &helper,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    req = json.loads(line)
+    sys.stdout.write(json.dumps({
+        "request_id": req["request_id"],
+        "ok": True,
+        "text": "final dictation from mlx",
+        "segments": []
+    }) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let mut config = Config::default();
+        config.transcription.mlx_audio_python = helper.display().to_string();
+        config.transcription.mlx_audio_warm = false;
+        let samples = vec![0.05; 16_000];
+
+        let result = transcribe_utterance_with_mlx_audio(&samples, &config)
+            .unwrap()
+            .expect("mlx dictation result");
+
+        assert_eq!(result.text, "final dictation from mlx");
+        assert!(result.is_final);
+        assert_eq!(result.duration_secs, 1.0);
     }
 
     #[test]

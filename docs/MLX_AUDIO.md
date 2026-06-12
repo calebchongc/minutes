@@ -5,7 +5,8 @@ engine on Apple Silicon. The default Minutes path stays Python-free; MLX setup
 creates a local Python environment only when you run `minutes setup
 --mlx-audio`. The engine is designed for larger local ASR models that are
 expensive to load: Minutes starts a small Python helper, loads the configured
-model once, and sends JSONL requests for saved audio.
+model once, and sends JSONL requests for saved audio or finalized
+live/dictation utterances.
 
 Treat this bridge as an experimental performance-testing lane for local ASR
 models beyond Whisper and Parakeet. Its goal is to let Minutes work with the
@@ -17,12 +18,27 @@ model.
 ## Scope
 
 `transcription.engine = "mlx-audio"` applies to saved-audio processing:
-`minutes process`, desktop post-recording processing, and meeting/memo
-processing.
+`minutes process`, desktop post-recording processing, meeting/memo processing,
+and recording-sidecar live transcript final utterances.
 
-Live transcript and dictation are intentionally out of scope for this first
-backend. They can continue to use Whisper, Apple Speech, or Parakeet while
-saved-audio processing uses MLX.
+Standalone live transcript can also use MLX with either inherited batch engine
+selection or an explicit backend:
+
+```toml
+[live_transcript]
+backend = "mlx-audio" # or "inherit" when transcription.engine = "mlx-audio"
+```
+
+Dictation can use MLX for final utterance text while keeping Whisper partials
+for the overlay:
+
+```toml
+[dictation]
+backend = "mlx-audio"
+```
+
+Live transcript and dictation emit final utterances only for MLX. They do not
+emit mid-utterance MLX partials.
 
 ## Setup
 
@@ -85,13 +101,14 @@ If a model returns text without timestamps, Minutes fails the transcription
 instead of inventing timing. Pick a timestamp-capable model or lower the chunk
 duration if the model exposes chunk-level timestamps.
 
-Live transcript and dictation do not use MLX in this phase.
+Live transcript and dictation do not need persisted segment timestamps. For
+those final-utterance flows, text-only MLX output is accepted.
 
 ## Warm Helper Behavior
 
 `mlx_audio_warm = true` keeps one helper process resident in the current
 Minutes process. That avoids repeated model loads for large local ASR models
-during batch runs.
+during batch runs and across finalized live/dictation utterances.
 
 Set `mlx_audio_warm = false` to spawn a fresh helper per request. For tests or
 debugging, `MINUTES_MLX_AUDIO_FORCE_ONESHOT=1` forces the one-shot path without

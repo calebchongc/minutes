@@ -41,7 +41,7 @@ So `minutes record --device "MacBook Pro Microphone"` always wins over `[recordi
 For MLX Audio setup and model caveats, see [`docs/MLX_AUDIO.md`](MLX_AUDIO.md).
 
 Saved-audio MLX transcripts require timestamped segments. Live transcript and
-dictation do not use MLX in this phase.
+dictation MLX final utterances may be text-only.
 
 ### `[diarization]` — speaker attribution
 
