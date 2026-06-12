@@ -172,6 +172,38 @@ pub fn transcribe(audio_path: &Path, config: &Config) -> Result<TranscribeResult
     Ok(result)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MlxAudioUtterance {
+    pub text: String,
+    pub duration_secs: f64,
+}
+
+const MLX_AUDIO_UTTERANCE_MIN_SAMPLES: usize = 16_000;
+
+/// Transcribe a finalized 16 kHz mono utterance for live/dictation flows.
+///
+/// Unlike saved-audio meeting transcription, live/dictation only need final
+/// text for the utterance. Text-only MLX helper output is accepted here, while
+/// [`transcribe`] continues to require timed segments.
+pub fn transcribe_utterance(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<MlxAudioUtterance>, TranscribeError> {
+    if samples.len() < MLX_AUDIO_UTTERANCE_MIN_SAMPLES {
+        return Ok(None);
+    }
+
+    let tmp_wav = tempfile::Builder::new()
+        .prefix("minutes-mlx-audio-utterance-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(TranscribeError::Io)?;
+    crate::transcribe::write_wav_16k_mono(tmp_wav.path(), samples)?;
+
+    let response = request_helper(tmp_wav.path(), config)?;
+    response_to_utterance(response, samples.len() as f64 / 16_000.0)
+}
+
 fn request_helper(audio_path: &Path, config: &Config) -> Result<HelperResponse, TranscribeError> {
     if config.transcription.mlx_audio_warm
         && std::env::var_os("MINUTES_MLX_AUDIO_FORCE_ONESHOT").is_none()
@@ -424,6 +456,41 @@ fn response_to_transcribe_result(
     }
 
     Ok(TranscribeResult { text, stats })
+}
+
+fn response_to_utterance(
+    response: HelperResponse,
+    duration_secs: f64,
+) -> Result<Option<MlxAudioUtterance>, TranscribeError> {
+    if response.ok == Some(false) {
+        return Err(TranscribeError::TranscriptionFailed(format!(
+            "mlx-audio helper failed: {}",
+            response.error.unwrap_or_else(|| "unknown error".into())
+        )));
+    }
+
+    let text = response.text.unwrap_or_default();
+    let text = if text.trim().is_empty() {
+        response
+            .segments
+            .unwrap_or_default()
+            .into_iter()
+            .map(|segment| segment.text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        text
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(MlxAudioUtterance {
+        text,
+        duration_secs,
+    }))
 }
 
 #[cfg(test)]
@@ -757,6 +824,55 @@ mod tests {
     }
 
     #[test]
+    fn utterance_response_accepts_text_only() {
+        let response = HelperResponse {
+            request_id: Some("r1".into()),
+            ok: Some(true),
+            error: None,
+            text: Some("plain text without timestamps".into()),
+            segments: Some(Vec::new()),
+            stats: None,
+        };
+
+        let result = response_to_utterance(response, 1.5)
+            .unwrap()
+            .expect("text-only live/dictation utterance should be accepted");
+
+        assert_eq!(result.text, "plain text without timestamps");
+        assert_eq!(result.duration_secs, 1.5);
+    }
+
+    #[test]
+    fn utterance_response_falls_back_to_segment_text() {
+        let response = HelperResponse {
+            request_id: Some("r1".into()),
+            ok: Some(true),
+            error: None,
+            text: Some(String::new()),
+            segments: Some(vec![
+                HelperSegment {
+                    start_secs: 0.0,
+                    end_secs: 1.0,
+                    text: "hello".into(),
+                },
+                HelperSegment {
+                    start_secs: 1.0,
+                    end_secs: 2.0,
+                    text: "world".into(),
+                },
+            ]),
+            stats: None,
+        };
+
+        let result = response_to_utterance(response, 2.0)
+            .unwrap()
+            .expect("segment text should become utterance text");
+
+        assert_eq!(result.text, "hello world");
+        assert_eq!(result.duration_secs, 2.0);
+    }
+
+    #[test]
     fn response_with_invalid_timestamps_is_hard_error() {
         let response = HelperResponse {
             request_id: Some("r1".into()),
@@ -821,6 +937,42 @@ for line in sys.stdin:
         assert_eq!(result.stats.raw_segments, 2);
         assert_eq!(result.stats.after_trailing_trim, 2);
         assert_eq!(result.stats.samples_after_silence_strip, 1600);
+        stop_global_helper();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transcribe_utterance_with_fake_helper_accepts_text_only() {
+        let _guard = test_lock();
+        stop_global_helper();
+        let dir = tempfile::tempdir().unwrap();
+        let helper = write_fake_helper(
+            dir.path(),
+            "helper_text_only.py",
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    req = json.loads(line)
+    sys.stdout.write(json.dumps({
+        "request_id": req["request_id"],
+        "ok": True,
+        "text": "final utterance from mlx",
+        "segments": []
+    }) + "\n")
+    sys.stdout.flush()
+"#,
+        );
+        let config = config_with_helper(&helper, false);
+        let samples = vec![0.01; 16_000];
+
+        let result = transcribe_utterance(&samples, &config)
+            .unwrap()
+            .expect("utterance text");
+
+        assert_eq!(result.text, "final utterance from mlx");
+        assert_eq!(result.duration_secs, 1.0);
         stop_global_helper();
     }
 
@@ -1159,6 +1311,15 @@ Outside Window: this should not be included
             "real MLX model must return timed segments"
         );
 
+        let samples = load_audio_samples(Path::new(&audio_path)).unwrap();
+        let utterance = transcribe_utterance(&samples, &config)
+            .unwrap()
+            .expect("real MLX model should return utterance text");
+        assert!(
+            !utterance.text.trim().is_empty(),
+            "real MLX utterance text must not be empty"
+        );
+        assert!(utterance.duration_secs > 0.0);
         stop_global_helper();
     }
 }
