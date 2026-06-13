@@ -785,6 +785,13 @@ enum Commands {
         demo: bool,
     },
 
+    /// Inspect experimental MLX Audio model compatibility
+    #[command(name = "mlx-audio")]
+    MlxAudio {
+        #[command(subcommand)]
+        action: MlxAudioAction,
+    },
+
     /// Inspect or register the meetings directory as a QMD collection
     Qmd {
         /// Action: status or register
@@ -1123,6 +1130,32 @@ enum SensitiveAction {
     },
     /// Stop the active sensitive meeting and write its artifact
     Stop,
+}
+
+#[derive(Subcommand)]
+enum MlxAudioAction {
+    /// Run one audio file through the configured MLX Audio helper and report output shape
+    Probe {
+        /// Audio file to transcribe for the probe
+        #[arg(long)]
+        audio: PathBuf,
+
+        /// MLX Audio model id/path. Defaults to transcription.mlx_audio_model
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Python executable for MLX Audio. Defaults to transcription.mlx_audio_python
+        #[arg(long)]
+        python: Option<String>,
+
+        /// Flow to check compatibility for
+        #[arg(long, default_value = "batch", value_parser = ["batch", "live", "dictation"])]
+        flow: String,
+
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1709,6 +1742,7 @@ fn main() -> Result<()> {
                 cmd_setup(&model, list, diarization)
             }
         }
+        Commands::MlxAudio { action } => cmd_mlx_audio(action, &config),
         Commands::Qmd { action, collection } => cmd_qmd(&action, &collection, &config),
         Commands::Automate {
             kind,
@@ -5613,6 +5647,194 @@ fn cmd_setup_mlx_audio(model: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_mlx_audio(action: MlxAudioAction, config: &Config) -> Result<()> {
+    match action {
+        MlxAudioAction::Probe {
+            audio,
+            model,
+            python,
+            flow,
+            json,
+        } => cmd_mlx_audio_probe(
+            &audio,
+            model.as_deref(),
+            python.as_deref(),
+            &flow,
+            json,
+            config,
+        ),
+    }
+}
+
+fn cmd_mlx_audio_probe(
+    audio: &Path,
+    model: Option<&str>,
+    python: Option<&str>,
+    flow: &str,
+    json: bool,
+    config: &Config,
+) -> Result<()> {
+    let mut config = config.clone();
+    config.transcription.engine = "mlx-audio".into();
+    if let Some(model) = model {
+        config.transcription.mlx_audio_model = model.into();
+    }
+    if let Some(python) = python {
+        config.transcription.mlx_audio_python = python.into();
+    }
+
+    let report = minutes_core::mlx_audio::probe(audio, &config)
+        .map_err(|error| anyhow::anyhow!("MLX Audio probe failed: {error}"))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_envelope("mlx-audio probe", &report))?
+        );
+    } else {
+        print!("{}", format_mlx_audio_probe_report(&report, flow));
+    }
+
+    if !mlx_audio_probe_flow_compatible(&report, flow) {
+        anyhow::bail!("{}", mlx_audio_probe_flow_error(flow, &report));
+    }
+
+    Ok(())
+}
+
+fn mlx_audio_probe_flow_compatible(
+    report: &minutes_core::mlx_audio::MlxAudioProbeReport,
+    flow: &str,
+) -> bool {
+    match flow {
+        "batch" => report.batch_compatible,
+        "live" => report.live_compatible,
+        "dictation" => report.dictation_compatible,
+        _ => false,
+    }
+}
+
+fn mlx_audio_probe_flow_error(
+    flow: &str,
+    report: &minutes_core::mlx_audio::MlxAudioProbeReport,
+) -> String {
+    match flow {
+        "batch" => format!(
+            "MLX Audio model `{}` is not compatible with saved meeting transcripts: batch processing requires real timed segments. Try Qwen3-ASR, Cohere Transcribe, Parakeet v3, or a model-specific timestamp mode.",
+            report.model
+        ),
+        "live" | "dictation" => format!(
+            "MLX Audio model `{}` is not compatible with the {flow} flow: final utterance flows require non-empty transcript text.",
+            report.model
+        ),
+        _ => format!("unknown MLX Audio probe flow: {flow}"),
+    }
+}
+
+fn format_mlx_audio_probe_report(
+    report: &minutes_core::mlx_audio::MlxAudioProbeReport,
+    flow: &str,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let selected = if mlx_audio_probe_flow_compatible(report, flow) {
+        "compatible"
+    } else {
+        "not compatible"
+    };
+
+    writeln!(output, "MLX Audio model probe").unwrap();
+    writeln!(output, "  Model: {}", report.model).unwrap();
+    writeln!(output, "  Audio: {}", report.audio_path).unwrap();
+    writeln!(output, "  Selected flow: {flow} ({selected})").unwrap();
+    writeln!(output).unwrap();
+    writeln!(output, "Compatibility").unwrap();
+    writeln!(
+        output,
+        "  Batch/meeting transcripts: {}",
+        yes_no(report.batch_compatible)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Live final utterances:     {}",
+        yes_no(report.live_compatible)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Dictation final text:      {}",
+        yes_no(report.dictation_compatible)
+    )
+    .unwrap();
+    writeln!(output).unwrap();
+    writeln!(output, "Output shape").unwrap();
+    writeln!(output, "  Text chars:             {}", report.text_chars).unwrap();
+    writeln!(
+        output,
+        "  Timed segments:         {}",
+        report.timed_segments
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Valid timed segments:   {}",
+        report.valid_timed_segments
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Invalid timed segments: {}",
+        report.invalid_timed_segments
+    )
+    .unwrap();
+    if let Some(segment) = &report.first_segment {
+        writeln!(
+            output,
+            "  First segment:          [{:.2}-{:.2}] {}",
+            segment.start_secs, segment.end_secs, segment.text_preview
+        )
+        .unwrap();
+    }
+    if !report.text_preview.trim().is_empty() {
+        writeln!(output, "  Text preview:           {}", report.text_preview).unwrap();
+    }
+    if let Some(stats) = &report.stats {
+        writeln!(output).unwrap();
+        writeln!(output, "Helper stats").unwrap();
+        if let Some(model_warm) = stats.model_warm {
+            writeln!(output, "  Model warm:   {}", yes_no(model_warm)).unwrap();
+        }
+        if let Some(cold_load_ms) = stats.cold_load_ms {
+            writeln!(output, "  Cold load ms: {}", cold_load_ms).unwrap();
+        }
+        if let Some(inference_ms) = stats.inference_ms {
+            writeln!(output, "  Inference ms: {}", inference_ms).unwrap();
+        }
+        if let Some(rtf) = stats.rtf {
+            writeln!(output, "  RTF:          {:.3}", rtf).unwrap();
+        }
+    }
+    if !report.notes.is_empty() {
+        writeln!(output).unwrap();
+        writeln!(output, "Notes").unwrap();
+        for note in &report.notes {
+            writeln!(output, "  - {note}").unwrap();
+        }
+    }
+
+    output
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 fn mlx_audio_setup_venv_dir() -> PathBuf {
     std::env::var_os(MLX_AUDIO_SETUP_VENV_ENV)
         .map(PathBuf::from)
@@ -6891,6 +7113,45 @@ mod tests {
                 assert_eq!(mlx_audio_model, "local/qwen3-asr");
             }
             _ => panic!("expected setup command"),
+        }
+    }
+
+    #[test]
+    fn mlx_audio_probe_clap_accepts_flags() {
+        let parsed = Cli::try_parse_from([
+            "minutes",
+            "mlx-audio",
+            "probe",
+            "--audio",
+            "audio.wav",
+            "--model",
+            "CohereLabs/cohere-transcribe-03-2026",
+            "--flow",
+            "live",
+            "--json",
+        ])
+        .expect("mlx-audio probe must parse");
+
+        match parsed.command {
+            Commands::MlxAudio {
+                action:
+                    MlxAudioAction::Probe {
+                        audio,
+                        model,
+                        flow,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(audio, PathBuf::from("audio.wav"));
+                assert_eq!(
+                    model.as_deref(),
+                    Some("CohereLabs/cohere-transcribe-03-2026")
+                );
+                assert_eq!(flow, "live");
+                assert!(json);
+            }
+            _ => panic!("expected mlx-audio probe command"),
         }
     }
 

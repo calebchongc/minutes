@@ -178,6 +178,41 @@ pub struct MlxAudioUtterance {
     pub duration_secs: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlxAudioProbeStats {
+    pub model_warm: Option<bool>,
+    pub cold_load_ms: Option<u64>,
+    pub inference_ms: Option<u64>,
+    pub rtf: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlxAudioProbeSegment {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub text_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlxAudioProbeReport {
+    pub model: String,
+    pub audio_path: String,
+    pub text_chars: usize,
+    pub text_preview: String,
+    pub timed_segments: usize,
+    pub valid_timed_segments: usize,
+    pub invalid_timed_segments: usize,
+    pub first_segment: Option<MlxAudioProbeSegment>,
+    pub batch_compatible: bool,
+    pub live_compatible: bool,
+    pub dictation_compatible: bool,
+    pub notes: Vec<String>,
+    pub stats: Option<MlxAudioProbeStats>,
+}
+
 const MLX_AUDIO_UTTERANCE_MIN_SAMPLES: usize = 16_000;
 
 /// Transcribe a finalized 16 kHz mono utterance for live/dictation flows.
@@ -202,6 +237,19 @@ pub fn transcribe_utterance(
 
     let response = request_helper(tmp_wav.path(), config)?;
     response_to_utterance(response, samples.len() as f64 / 16_000.0)
+}
+
+/// Inspect one MLX Audio model run and classify whether its output shape is
+/// suitable for Minutes batch and final-utterance flows.
+pub fn probe(audio_path: &Path, config: &Config) -> Result<MlxAudioProbeReport, TranscribeError> {
+    let samples = load_audio_samples(audio_path)?;
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+    drop(samples);
+
+    let response = request_helper(audio_path, config)?;
+    response_to_probe_report(response, audio_path, &config.transcription.mlx_audio_model)
 }
 
 fn request_helper(audio_path: &Path, config: &Config) -> Result<HelperResponse, TranscribeError> {
@@ -426,6 +474,24 @@ fn response_to_transcribe_result(
         )));
     }
 
+    if let Some(segment) = segments.iter().find(|segment| {
+        !segment.start_secs.is_finite()
+            || !segment.end_secs.is_finite()
+            || segment.start_secs < 0.0
+            || segment.end_secs < segment.start_secs
+    }) {
+        return Err(TranscribeError::TranscriptionFailed(format!(
+            "timestamped transcript segment has invalid bounds: start={}, end={}",
+            segment.start_secs, segment.end_secs
+        )));
+    }
+    if !segments.iter().any(is_real_timed_segment) {
+        return Err(TranscribeError::TranscriptionFailed(
+            "mlx-audio output did not include real timed segments; saved meeting transcripts require start/end timestamps with positive duration"
+                .into(),
+        ));
+    }
+
     let timed_segments: Vec<TimedTranscriptSegment> = segments
         .into_iter()
         .map(|segment| TimedTranscriptSegment {
@@ -456,6 +522,102 @@ fn response_to_transcribe_result(
     }
 
     Ok(TranscribeResult { text, stats })
+}
+
+fn response_to_probe_report(
+    response: HelperResponse,
+    audio_path: &Path,
+    model: &str,
+) -> Result<MlxAudioProbeReport, TranscribeError> {
+    if response.ok == Some(false) {
+        return Err(TranscribeError::TranscriptionFailed(format!(
+            "mlx-audio helper failed: {}",
+            response.error.unwrap_or_else(|| "unknown error".into())
+        )));
+    }
+
+    let text = response.text.unwrap_or_default();
+    let segments = response.segments.unwrap_or_default();
+    let timed_segments = segments.len();
+    let valid_timed_segments = segments
+        .iter()
+        .filter(|segment| is_real_timed_segment(segment))
+        .count();
+    let invalid_timed_segments = timed_segments.saturating_sub(valid_timed_segments);
+    let segment_text_present = segments
+        .iter()
+        .any(|segment| !segment.text.trim().is_empty());
+    let text_present = !text.trim().is_empty() || segment_text_present;
+    let batch_compatible = valid_timed_segments > 0 && invalid_timed_segments == 0;
+    let live_compatible = text_present;
+    let dictation_compatible = text_present;
+    let mut notes = Vec::new();
+
+    if batch_compatible {
+        notes.push(
+            "Batch/meeting transcripts can use this output shape: the model returned real timed segments."
+                .into(),
+        );
+    } else if text_present {
+        notes.push(
+            "This model returned text but no fully usable timed segments; live/dictation final utterances can use it, but saved meeting transcripts require timed segments."
+                .into(),
+        );
+    } else {
+        notes.push(
+            "This model did not return transcript text; it is not suitable for Minutes STT flows in this run."
+                .into(),
+        );
+    }
+
+    if timed_segments == 0 {
+        notes.push(
+            "No timed segments were returned. Try a timestamp-capable model such as Qwen3-ASR, Cohere Transcribe, or Parakeet, or a model-specific timestamp mode."
+                .into(),
+        );
+    } else if invalid_timed_segments > 0 {
+        notes.push(
+            "Some returned segments had missing, empty, non-finite, negative, backwards, or zero-duration timing."
+                .into(),
+        );
+    }
+
+    Ok(MlxAudioProbeReport {
+        model: model.into(),
+        audio_path: audio_path.display().to_string(),
+        text_chars: text.chars().count(),
+        text_preview: char_preview(&text, 200),
+        timed_segments,
+        valid_timed_segments,
+        invalid_timed_segments,
+        first_segment: segments.first().map(|segment| MlxAudioProbeSegment {
+            start_secs: segment.start_secs,
+            end_secs: segment.end_secs,
+            text_preview: char_preview(&segment.text, 120),
+        }),
+        batch_compatible,
+        live_compatible,
+        dictation_compatible,
+        notes,
+        stats: response.stats.map(|stats| MlxAudioProbeStats {
+            model_warm: stats.model_warm,
+            cold_load_ms: stats.cold_load_ms,
+            inference_ms: stats.inference_ms,
+            rtf: stats.rtf,
+        }),
+    })
+}
+
+fn is_real_timed_segment(segment: &HelperSegment) -> bool {
+    segment.start_secs.is_finite()
+        && segment.end_secs.is_finite()
+        && segment.start_secs >= 0.0
+        && segment.end_secs > segment.start_secs
+        && !segment.text.trim().is_empty()
+}
+
+fn char_preview(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
 }
 
 fn response_to_utterance(
@@ -889,6 +1051,97 @@ mod tests {
         let err = response_to_transcribe_result(response, FilterStats::default(), &config())
             .expect_err("invalid timestamps must be rejected");
         assert!(err.to_string().contains("invalid bounds"));
+    }
+
+    #[test]
+    fn response_with_zero_duration_timestamp_is_hard_error() {
+        let response = HelperResponse {
+            request_id: Some("r1".into()),
+            ok: Some(true),
+            error: None,
+            text: Some("dummy timestamp".into()),
+            segments: Some(vec![HelperSegment {
+                start_secs: 0.0,
+                end_secs: 0.0,
+                text: "dummy timestamp".into(),
+            }]),
+            stats: None,
+        };
+        let err = response_to_transcribe_result(response, FilterStats::default(), &config())
+            .expect_err("zero-duration timestamps must be rejected");
+        assert!(err.to_string().contains("real timed segments"));
+    }
+
+    #[test]
+    fn probe_report_with_timed_segments_is_batch_compatible() {
+        let response = HelperResponse {
+            request_id: Some("r1".into()),
+            ok: Some(true),
+            error: None,
+            text: Some("hello from mlx".into()),
+            segments: Some(vec![HelperSegment {
+                start_secs: 0.0,
+                end_secs: 1.25,
+                text: "hello from mlx".into(),
+            }]),
+            stats: Some(HelperStats {
+                model_warm: Some(true),
+                cold_load_ms: Some(0),
+                inference_ms: Some(120),
+                rtf: Some(0.1),
+            }),
+        };
+
+        let report =
+            response_to_probe_report(response, Path::new("audio.wav"), "local/timed-model")
+                .unwrap();
+
+        assert_eq!(report.model, "local/timed-model");
+        assert_eq!(report.timed_segments, 1);
+        assert_eq!(report.valid_timed_segments, 1);
+        assert!(report.batch_compatible);
+        assert!(report.live_compatible);
+        assert!(report.dictation_compatible);
+        assert_eq!(
+            report
+                .first_segment
+                .as_ref()
+                .map(|segment| segment.end_secs),
+            Some(1.25)
+        );
+        assert_eq!(
+            report.stats.as_ref().and_then(|stats| stats.inference_ms),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn probe_report_with_text_only_is_live_but_not_batch_compatible() {
+        let response = HelperResponse {
+            request_id: Some("r1".into()),
+            ok: Some(true),
+            error: None,
+            text: Some("plain text without timestamps".into()),
+            segments: Some(Vec::new()),
+            stats: None,
+        };
+
+        let report =
+            response_to_probe_report(response, Path::new("audio.wav"), "local/text-only-model")
+                .unwrap();
+
+        assert_eq!(report.timed_segments, 0);
+        assert!(!report.batch_compatible);
+        assert!(report.live_compatible);
+        assert!(report.dictation_compatible);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("saved meeting transcripts require timed segments")),
+            "{:?}",
+            report.notes
+        );
     }
 
     #[test]
