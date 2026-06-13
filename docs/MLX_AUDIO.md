@@ -5,7 +5,8 @@ engine on Apple Silicon. The default Minutes path stays Python-free; MLX setup
 creates a local Python environment only when you run `minutes setup
 --mlx-audio`. The engine is designed for larger local ASR models that are
 expensive to load: Minutes starts a small Python helper, loads the configured
-model once, and sends JSONL requests for saved audio.
+model once, and sends JSONL requests for saved audio or finalized
+live/dictation utterances.
 
 Treat this bridge as an experimental performance-testing lane for local ASR
 models beyond Whisper and Parakeet. Its goal is to let Minutes work with the
@@ -17,12 +18,72 @@ model.
 ## Scope
 
 `transcription.engine = "mlx-audio"` applies to saved-audio processing:
-`minutes process`, desktop post-recording processing, and meeting/memo
-processing.
+`minutes process`, desktop post-recording processing, meeting/memo processing,
+and recording-sidecar live transcript final utterances.
 
-Live transcript and dictation are intentionally out of scope for this first
-backend. They can continue to use Whisper, Apple Speech, or Parakeet while
-saved-audio processing uses MLX.
+Standalone live transcript can also use MLX with either inherited batch engine
+selection or an explicit backend:
+
+```toml
+[live_transcript]
+backend = "mlx-audio" # or "inherit" when transcription.engine = "mlx-audio"
+```
+
+Dictation can use MLX for final utterance text while keeping Whisper partials
+for the overlay:
+
+```toml
+[dictation]
+backend = "mlx-audio"
+```
+
+Live transcript and dictation emit final utterances only for MLX. They do not
+emit mid-utterance MLX partials.
+
+## Model Suitability
+
+`mlx-audio` support means a model can load through the MLX Audio Python API.
+Minutes compatibility also depends on the output shape:
+
+- Saved meeting/memo transcripts require real timed segments with start/end
+  seconds and text.
+- Live transcript and dictation final utterances only require non-empty text.
+- The probe command below checks output shape. It does not measure WER,
+  timestamp accuracy, diarization quality, or long-form stability.
+
+| Model family | Batch meetings | Live/dictation | Notes |
+| --- | --- | --- | --- |
+| Qwen3-ASR | Yes | Yes | Recommended first experimental lane; returns timed `segments`. |
+| Cohere Transcribe | Yes | Yes | Good long-form candidate; returns timed `segments` and has its own chunking/VAD options upstream. |
+| Parakeet via MLX Audio | Yes | Yes | Useful parity/control path; Minutes also has a native Parakeet backend. |
+| MLX Whisper / Distil-Whisper | Yes | Yes | Useful controls for MLX overhead and timestamp behavior. |
+| VibeVoice-ASR | Maybe | Maybe | Promising structured output with speaker/time fields; treat as research until verified on real meetings. |
+| Granite Speech Plus | No by default | Yes | Plain ASR currently returns text only. Batch use needs a timestamp-tag parser or adapter support that emits real segments. |
+| Voxtral / Voxtral Realtime | No by default | Yes | Good final-utterance experiment; the current Minutes bridge does not consume true streaming deltas. |
+| Moonshine, Fun-ASR-Nano, Canary, MMS, SenseVoice, FireRedASR2 | No by default | Usually | Current adapters are text-only, dummy-timestamped, or metadata-oriented; use for live/dictation experiments first. |
+
+Use the probe before switching daily-driver meeting transcription to a new
+model:
+
+```bash
+minutes mlx-audio probe \
+  --audio /path/to/short-sample.wav \
+  --model mlx-community/Qwen3-ASR-1.7B-8bit \
+  --flow batch
+```
+
+For text-only final-utterance experiments:
+
+```bash
+minutes mlx-audio probe \
+  --audio /path/to/short-sample.wav \
+  --model ibm-granite/granite-speech-4.1-2b-plus \
+  --flow live
+```
+
+The probe prints whether the selected model run is compatible with batch
+meeting transcripts, live final utterances, and dictation final text. JSON
+output is available with `--json` for scripts or issue reports.
 
 ## Setup
 
@@ -85,13 +146,14 @@ If a model returns text without timestamps, Minutes fails the transcription
 instead of inventing timing. Pick a timestamp-capable model or lower the chunk
 duration if the model exposes chunk-level timestamps.
 
-Live transcript and dictation do not use MLX in this phase.
+Live transcript and dictation do not need persisted segment timestamps. For
+those final-utterance flows, text-only MLX output is accepted.
 
 ## Warm Helper Behavior
 
 `mlx_audio_warm = true` keeps one helper process resident in the current
 Minutes process. That avoids repeated model loads for large local ASR models
-during batch runs.
+during batch runs and across finalized live/dictation utterances.
 
 Set `mlx_audio_warm = false` to spawn a fresh helper per request. For tests or
 debugging, `MINUTES_MLX_AUDIO_FORCE_ONESHOT=1` forces the one-shot path without

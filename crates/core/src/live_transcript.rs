@@ -101,6 +101,10 @@ pub const APPLE_SPEECH_LIVE_SCOPE_WARNING: &str =
 pub const APPLE_SPEECH_LIVE_FALLBACK_WARNING: &str =
     "apple-speech live transcription failed; falling back to parakeet or whisper for this session";
 
+pub const MLX_AUDIO_SCOPE_DOC_REF: &str = "docs/MLX_AUDIO.md";
+pub const MLX_AUDIO_LIVE_FALLBACK_WARNING: &str =
+    "mlx-audio live transcription failed; falling back to whisper for this session";
+
 /// True iff this build can route `engine = "parakeet"` to the parakeet path.
 /// Used at session start to decide between scope-warning (compile-time gap)
 /// and the real parakeet dispatch.
@@ -208,6 +212,27 @@ fn emit_live_engine_fallback_warning(source: &'static str, detail: &str) {
             "source": source,
             "detail": detail,
             "doc_ref": PARAKEET_SCOPE_DOC_REF,
+        }
+    }))
+    .ok();
+}
+
+fn emit_mlx_audio_fallback_warning(source: &'static str, detail: &str) {
+    eprintln!(
+        "[minutes] {} (detail: {})",
+        MLX_AUDIO_LIVE_FALLBACK_WARNING, detail
+    );
+    tracing::warn!(source, detail, "{}", MLX_AUDIO_LIVE_FALLBACK_WARNING);
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "live_transcript_mlx_audio_fallback",
+        "file": "",
+        "message": MLX_AUDIO_LIVE_FALLBACK_WARNING,
+        "extra": {
+            "source": source,
+            "detail": detail,
+            "doc_ref": MLX_AUDIO_SCOPE_DOC_REF,
         }
     }))
     .ok();
@@ -719,6 +744,8 @@ fn run_inner(
     let parakeet_live_enabled = false;
     #[cfg(not(feature = "parakeet"))]
     let parakeet_fallback_ready = false;
+    let mut mlx_audio_utterance_samples: Vec<f32> = Vec::new();
+    let mut mlx_audio_live_enabled = standalone_backend.eq_ignore_ascii_case("mlx-audio");
 
     let mut was_speaking = false;
     let mut utterance_samples: usize = 0;
@@ -799,6 +826,8 @@ fn run_inner(
                     parakeet_fallback_ready,
                     &mut parakeet_live_enabled,
                     &mut parakeet_utterance_samples,
+                    &mut mlx_audio_live_enabled,
+                    &mut mlx_audio_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -811,6 +840,8 @@ fn run_inner(
                     #[cfg(target_os = "macos")]
                     &mut apple_utterance_samples,
                     parakeet_fallback_ready,
+                    &mut mlx_audio_live_enabled,
+                    &mut mlx_audio_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -832,6 +863,8 @@ fn run_inner(
                     parakeet_fallback_ready,
                     &mut parakeet_live_enabled,
                     &mut parakeet_utterance_samples,
+                    &mut mlx_audio_live_enabled,
+                    &mut mlx_audio_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -844,6 +877,8 @@ fn run_inner(
                     #[cfg(target_os = "macos")]
                     &mut apple_utterance_samples,
                     parakeet_fallback_ready,
+                    &mut mlx_audio_live_enabled,
+                    &mut mlx_audio_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -881,6 +916,7 @@ fn run_inner(
                     apple_utterance_samples.clear();
                     #[cfg(feature = "parakeet")]
                     parakeet_utterance_samples.clear();
+                    mlx_audio_utterance_samples.clear();
                     utterance_samples = 0;
                     was_speaking = false;
                     continue;
@@ -897,6 +933,8 @@ fn run_inner(
                             parakeet_fallback_ready,
                             &mut parakeet_live_enabled,
                             &mut parakeet_utterance_samples,
+                            &mut mlx_audio_live_enabled,
+                            &mut mlx_audio_utterance_samples,
                             config,
                             &mut streaming,
                             &mut whisper_ctx,
@@ -909,6 +947,8 @@ fn run_inner(
                             #[cfg(target_os = "macos")]
                             &mut apple_utterance_samples,
                             parakeet_fallback_ready,
+                            &mut mlx_audio_live_enabled,
+                            &mut mlx_audio_utterance_samples,
                             config,
                             &mut streaming,
                             &mut whisper_ctx,
@@ -952,6 +992,7 @@ fn run_inner(
                         apple_utterance_samples.clear();
                         #[cfg(feature = "parakeet")]
                         parakeet_utterance_samples.clear();
+                        mlx_audio_utterance_samples.clear();
                         utterance_samples = 0;
                         was_speaking = false;
                         continue;
@@ -968,6 +1009,8 @@ fn run_inner(
                                 parakeet_fallback_ready,
                                 &mut parakeet_live_enabled,
                                 &mut parakeet_utterance_samples,
+                                &mut mlx_audio_live_enabled,
+                                &mut mlx_audio_utterance_samples,
                                 config,
                                 &mut streaming,
                                 &mut whisper_ctx,
@@ -980,6 +1023,8 @@ fn run_inner(
                                 #[cfg(target_os = "macos")]
                                 &mut apple_utterance_samples,
                                 parakeet_fallback_ready,
+                                &mut mlx_audio_live_enabled,
+                                &mut mlx_audio_utterance_samples,
                                 config,
                                 &mut streaming,
                                 &mut whisper_ctx,
@@ -1011,6 +1056,8 @@ fn run_inner(
                 {
                     parakeet_utterance_samples.extend_from_slice(&chunk.samples);
                 }
+            } else if mlx_audio_live_enabled {
+                mlx_audio_utterance_samples.extend_from_slice(&chunk.samples);
             } else if let Ok(whisper_ctx) = ensure_live_whisper_ctx(&mut whisper_ctx, config) {
                 if let Some(_sr) = streaming.feed(&chunk.samples, whisper_ctx) {
                     // Intentionally not emitted in event-bus v0. Partial
@@ -1030,6 +1077,8 @@ fn run_inner(
                     parakeet_fallback_ready,
                     &mut parakeet_live_enabled,
                     &mut parakeet_utterance_samples,
+                    &mut mlx_audio_live_enabled,
+                    &mut mlx_audio_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -1042,6 +1091,8 @@ fn run_inner(
                     #[cfg(target_os = "macos")]
                     &mut apple_utterance_samples,
                     parakeet_fallback_ready,
+                    &mut mlx_audio_live_enabled,
+                    &mut mlx_audio_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -1065,6 +1116,8 @@ fn run_inner(
                 parakeet_fallback_ready,
                 &mut parakeet_live_enabled,
                 &mut parakeet_utterance_samples,
+                &mut mlx_audio_live_enabled,
+                &mut mlx_audio_utterance_samples,
                 config,
                 &mut streaming,
                 &mut whisper_ctx,
@@ -1077,6 +1130,8 @@ fn run_inner(
                 #[cfg(target_os = "macos")]
                 &mut apple_utterance_samples,
                 parakeet_fallback_ready,
+                &mut mlx_audio_live_enabled,
+                &mut mlx_audio_utterance_samples,
                 config,
                 &mut streaming,
                 &mut whisper_ctx,
@@ -1576,7 +1631,22 @@ fn transcribe_utterance_for_sidecar(
     config: &Config,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
     parakeet_enabled: &mut bool,
+    mlx_audio_enabled: &mut bool,
 ) -> Option<(String, f64)> {
+    if *mlx_audio_enabled {
+        match transcribe_with_mlx_audio_for_live_sidecar(samples, config) {
+            Ok(result) => return result,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live recording-sidecar mlx-audio path failed — switching this session to whisper"
+                );
+                *mlx_audio_enabled = false;
+                emit_mlx_audio_fallback_warning("recording-sidecar", &error.to_string());
+            }
+        }
+    }
+
     #[cfg(feature = "parakeet")]
     if *parakeet_enabled {
         match transcribe_with_parakeet_for_live_sidecar(samples, config) {
@@ -1657,6 +1727,19 @@ fn transcribe_with_parakeet_for_live_sidecar(
 
     match crate::transcribe::transcribe(tmp_wav.path(), config) {
         Ok(result) => Ok(Some((result.text, samples.len() as f64 / 16000.0))),
+        Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_with_mlx_audio_for_live_sidecar(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<(String, f64)>, MinutesError> {
+    match crate::mlx_audio::transcribe_utterance(samples, config) {
+        Ok(Some(result)) => Ok(Some((result.text, result.duration_secs))),
+        Ok(None) => Ok(None),
         Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -1787,6 +1870,8 @@ fn finalize_live_utterance(
     parakeet_fallback_ready: bool,
     parakeet_live_enabled: &mut bool,
     parakeet_utterance_samples: &mut Vec<f32>,
+    mlx_audio_live_enabled: &mut bool,
+    mlx_audio_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -1859,6 +1944,51 @@ fn finalize_live_utterance(
                     Err(_) => {}
                 }
                 apple_utterance_samples.clear();
+                return true;
+            }
+        }
+    }
+
+    if *mlx_audio_live_enabled {
+        match transcribe_with_mlx_audio_for_live_sidecar(mlx_audio_utterance_samples, config) {
+            Ok(Some((text, duration_secs))) => {
+                let ok = writer.write_utterance(&text, duration_secs);
+                mlx_audio_utterance_samples.clear();
+                return ok;
+            }
+            Ok(None) => {
+                mlx_audio_utterance_samples.clear();
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live mlx-audio path failed — switching this session to whisper"
+                );
+                *mlx_audio_live_enabled = false;
+                emit_mlx_audio_fallback_warning(source, &error.to_string());
+                match ensure_live_whisper_ctx(whisper_ctx, config) {
+                    Ok(whisper_ctx) => {
+                        if let Some((text, duration_secs)) =
+                            transcribe_with_whisper_for_live_sidecar(
+                                mlx_audio_utterance_samples,
+                                whisper_ctx,
+                                config.transcription.language.clone(),
+                            )
+                        {
+                            let ok = writer.write_utterance(&text, duration_secs);
+                            mlx_audio_utterance_samples.clear();
+                            return ok;
+                        }
+                    }
+                    Err(load_error) => {
+                        tracing::error!(
+                            error = %load_error,
+                            "failed to load whisper fallback after mlx-audio live failure"
+                        );
+                    }
+                }
+                mlx_audio_utterance_samples.clear();
                 return true;
             }
         }
@@ -1948,6 +2078,8 @@ fn finalize_on_exit(
     parakeet_fallback_ready: bool,
     parakeet_live_enabled: &mut bool,
     parakeet_utterance_samples: &mut Vec<f32>,
+    mlx_audio_live_enabled: &mut bool,
+    mlx_audio_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -1961,6 +2093,8 @@ fn finalize_on_exit(
         parakeet_fallback_ready,
         parakeet_live_enabled,
         parakeet_utterance_samples,
+        mlx_audio_live_enabled,
+        mlx_audio_utterance_samples,
         config,
         streaming,
         whisper_ctx,
@@ -1979,6 +2113,8 @@ fn finalize_live_utterance(
     apple_live_enabled: &mut bool,
     #[cfg(target_os = "macos")] apple_utterance_samples: &mut Vec<f32>,
     _parakeet_fallback_ready: bool,
+    mlx_audio_live_enabled: &mut bool,
+    mlx_audio_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -2030,6 +2166,51 @@ fn finalize_live_utterance(
         }
     }
 
+    if *mlx_audio_live_enabled {
+        match transcribe_with_mlx_audio_for_live_sidecar(mlx_audio_utterance_samples, config) {
+            Ok(Some((text, duration_secs))) => {
+                let ok = writer.write_utterance(&text, duration_secs);
+                mlx_audio_utterance_samples.clear();
+                return ok;
+            }
+            Ok(None) => {
+                mlx_audio_utterance_samples.clear();
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live mlx-audio path failed — switching this session to whisper"
+                );
+                *mlx_audio_live_enabled = false;
+                emit_mlx_audio_fallback_warning(source, &error.to_string());
+                match ensure_live_whisper_ctx(whisper_ctx, config) {
+                    Ok(whisper_ctx) => {
+                        if let Some((text, duration_secs)) =
+                            transcribe_with_whisper_for_live_sidecar(
+                                mlx_audio_utterance_samples,
+                                whisper_ctx,
+                                config.transcription.language.clone(),
+                            )
+                        {
+                            let ok = writer.write_utterance(&text, duration_secs);
+                            mlx_audio_utterance_samples.clear();
+                            return ok;
+                        }
+                    }
+                    Err(load_error) => {
+                        tracing::error!(
+                            error = %load_error,
+                            "failed to load whisper fallback after mlx-audio live failure"
+                        );
+                    }
+                }
+                mlx_audio_utterance_samples.clear();
+                return true;
+            }
+        }
+    }
+
     let write_ok = match ensure_live_whisper_ctx(whisper_ctx, config) {
         Ok(whisper_ctx) => {
             if let Some(sr) = streaming.finalize(whisper_ctx) {
@@ -2059,6 +2240,8 @@ fn finalize_on_exit(
     apple_live_enabled: &mut bool,
     #[cfg(target_os = "macos")] apple_utterance_samples: &mut Vec<f32>,
     parakeet_fallback_ready: bool,
+    mlx_audio_live_enabled: &mut bool,
+    mlx_audio_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -2070,6 +2253,8 @@ fn finalize_on_exit(
         #[cfg(target_os = "macos")]
         apple_utterance_samples,
         parakeet_fallback_ready,
+        mlx_audio_live_enabled,
+        mlx_audio_utterance_samples,
         config,
         streaming,
         whisper_ctx,
@@ -2150,6 +2335,10 @@ fn run_sidecar_inner_mpsc(
 
     let mut vad = RecordingSidecarVad::new(config);
     let parakeet_live_enabled = live_supports_parakeet(&config.transcription.engine);
+    let mlx_audio_live_enabled = config
+        .transcription
+        .engine
+        .eq_ignore_ascii_case("mlx-audio");
     let mut was_speaking = false;
     let mut utterance: Vec<f32> = Vec::new();
     let mut gating_stats = SidecarGatingStats::default();
@@ -2192,6 +2381,7 @@ fn run_sidecar_inner_mpsc(
             .name("live-sidecar-transcribe".into())
             .spawn(move || {
                 let mut parakeet_enabled = parakeet_live_enabled;
+                let mut mlx_audio_enabled = mlx_audio_live_enabled;
                 // Loaded lazily on first whisper-path utterance: the load can
                 // take >10s for larger models, and doing it eagerly (worse, on
                 // the consumer thread, as before) dropped the first ~13s of
@@ -2210,6 +2400,7 @@ fn run_sidecar_inner_mpsc(
                         &config,
                         &mut whisper_ctx,
                         &mut parakeet_enabled,
+                        &mut mlx_audio_enabled,
                     );
                     pending.fetch_sub(1, Ordering::Relaxed);
                     if let Some((text, duration_secs)) = result {
@@ -2678,6 +2869,35 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn write_fake_mlx_helper(dir: &Path, text: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper = dir.join("fake-mlx-helper.py");
+        let body = format!(
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    req = json.loads(line)
+    sys.stdout.write(json.dumps({{
+        "request_id": req["request_id"],
+        "ok": True,
+        "text": {text:?},
+        "segments": []
+    }}) + "\n")
+    sys.stdout.flush()
+"#,
+            text = text
+        );
+        std::fs::write(&helper, body).unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        helper
+    }
+
     #[test]
     fn test_transcript_line_roundtrip() {
         let line = TranscriptLine {
@@ -2764,6 +2984,80 @@ mod tests {
 
         assert_eq!(pending.load(Ordering::Relaxed), 0);
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "whisper"))]
+    fn mlx_audio_live_helper_accepts_text_only_output() {
+        let dir = tempdir().unwrap();
+        let helper = write_fake_mlx_helper(dir.path(), "live utterance from mlx");
+        let mut config = Config::default();
+        config.transcription.mlx_audio_python = helper.display().to_string();
+        config.transcription.mlx_audio_warm = false;
+        let samples = vec![0.05; 16_000];
+
+        let result = transcribe_with_mlx_audio_for_live_sidecar(&samples, &config)
+            .unwrap()
+            .expect("mlx live result");
+
+        assert_eq!(result.0, "live utterance from mlx");
+        assert_eq!(result.1, 1.0);
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "whisper"))]
+    fn recording_sidecar_dispatch_uses_mlx_audio_without_loading_whisper() {
+        let dir = tempdir().unwrap();
+        let helper = write_fake_mlx_helper(dir.path(), "sidecar utterance from mlx");
+        let mut config = Config::default();
+        config.transcription.engine = "mlx-audio".into();
+        config.transcription.mlx_audio_python = helper.display().to_string();
+        config.transcription.mlx_audio_warm = false;
+        let samples = vec![0.05; 16_000];
+        let mut whisper_ctx = None;
+        let mut parakeet_enabled = false;
+        let mut mlx_audio_enabled = true;
+
+        let result = transcribe_utterance_for_sidecar(
+            &samples,
+            &config,
+            &mut whisper_ctx,
+            &mut parakeet_enabled,
+            &mut mlx_audio_enabled,
+        )
+        .expect("sidecar result");
+
+        assert_eq!(result.0, "sidecar utterance from mlx");
+        assert_eq!(result.1, 1.0);
+        assert!(mlx_audio_enabled);
+        assert!(whisper_ctx.is_none());
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "whisper"))]
+    fn recording_sidecar_mpsc_writes_mlx_audio_utterance_to_jsonl() {
+        with_temp_home(|| {
+            let dir = tempdir().unwrap();
+            let helper = write_fake_mlx_helper(dir.path(), "queued sidecar utterance from mlx");
+            let mut config = Config::default();
+            config.transcription.engine = "mlx-audio".into();
+            config.transcription.mlx_audio_python = helper.display().to_string();
+            config.transcription.mlx_audio_warm = false;
+            config.transcription.vad_model = String::new();
+            config.live_transcript.save_wav = false;
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            for _ in 0..12 {
+                tx.send(vec![0.2; 1600]).unwrap();
+            }
+            drop(tx);
+
+            run_sidecar_inner_mpsc(rx, Arc::new(AtomicBool::new(false)), &config).unwrap();
+
+            let lines = read_since_line_from_path(&pid::live_transcript_jsonl_path(), 0).unwrap();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].text, "queued sidecar utterance from mlx");
+        });
     }
 
     #[test]
