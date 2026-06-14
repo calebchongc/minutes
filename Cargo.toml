@@ -33,6 +33,7 @@ hound = "3.5"
 # recording (issue #163). Pair with `whisper_rs::install_logging_hooks()` at
 # process startup.
 whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+sherpa-onnx = { version = "1.13.2", default-features = true }
 
 # File watching
 notify = "7"
@@ -70,6 +71,8 @@ schemars = { version = "1", features = ["derive", "chrono04"] }
 
 # Audio format conversion
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "wav", "isomp4"] }
+tar = "0.4.46"
+bzip2 = "0.6.1"
 
 # Noise reduction (pure Rust RNNoise port)
 nnnoiseless = "0.5"

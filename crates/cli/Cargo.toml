@@ -20,6 +20,7 @@ default = ["whisper", "diarize"]
 whisper = ["minutes-core/whisper"]
 diarize = ["minutes-core/diarize", "dep:pyannote-rs", "dep:ort", "dep:symphonia"]
 parakeet = ["minutes-core/parakeet"]
+sherpa-onnx = ["minutes-core/sherpa-onnx"]
 # Streaming Silero VAD via ort. Pulls minutes-core's vad-ort. Also
 # wires the setup-time download for silero-vad-v6.2.0.onnx.
 vad-ort = ["minutes-core/vad-ort", "dep:ort"]
@@ -52,6 +53,8 @@ pyannote-rs = { workspace = true, optional = true }
 # Remove once pyannote-rs ships a fix (tracked: thewh1teagle/pyannote-rs#27).
 ort = { version = "=2.0.0-rc.10", optional = true }
 symphonia = { workspace = true, optional = true }
+tar = { workspace = true }
+bzip2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

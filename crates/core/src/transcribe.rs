@@ -403,6 +403,7 @@ fn transcribe_dispatch(
         "whisper" => transcribe_whisper_dispatch(audio_path, config, hints),
         "parakeet" => transcribe_parakeet_dispatch(audio_path, config, hints),
         "mlx-audio" => crate::mlx_audio::transcribe(audio_path, config),
+        "sherpa-onnx" => crate::sherpa_onnx::transcribe(audio_path, config),
         "apple-speech" => {
             tracing::warn!(
                 "apple-speech is experimental and live-transcript-only today — falling back to whisper for batch/default transcription"

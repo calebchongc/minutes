@@ -13,6 +13,7 @@ categories = ["multimedia::audio", "command-line-utilities"]
 default = ["whisper"]
 whisper = ["dep:whisper-rs", "whisper-guard/whisper"]
 parakeet = []  # subprocess-based, uses tempfile for concurrent safety
+sherpa-onnx = ["dep:sherpa-onnx"]
 diarize = ["dep:pyannote-rs", "dep:ort", "dep:ndarray"]
 coreml = ["whisper-rs/coreml"]
 cuda = ["whisper-rs/cuda"]
@@ -41,6 +42,7 @@ cpal = { workspace = true }
 hound = { workspace = true }
 notify = { workspace = true }
 whisper-rs = { workspace = true, optional = true }
+sherpa-onnx = { workspace = true, optional = true }
 symphonia = { workspace = true }
 ureq = { workspace = true }
 fs2 = { workspace = true }

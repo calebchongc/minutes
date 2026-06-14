@@ -105,8 +105,8 @@ impl Default for VoiceConfig {
 #[serde(default)]
 pub struct TranscriptionConfig {
     /// Transcription engine: "whisper" (default), "parakeet", "mlx-audio"
-    /// (experimental), or "apple-speech" (experimental live-transcript-only
-    /// path on macOS 26+).
+    /// (experimental), "sherpa-onnx" (experimental), or "apple-speech"
+    /// (experimental live-transcript-only path on macOS 26+).
     pub engine: String,
     pub model: String,
     pub model_path: PathBuf,
@@ -229,10 +229,22 @@ pub struct TranscriptionConfig {
     /// Chunk duration passed to MLX Audio models that expose chunk-level
     /// timestamps, such as Qwen3-ASR.
     pub mlx_audio_chunk_secs: f64,
+    /// Sherpa ONNX model profile id or local model package name.
+    pub sherpa_onnx_model: String,
+    /// Optional explicit Sherpa ONNX model directory. When unset, resolves
+    /// under model_path/sherpa-onnx/<sherpa_onnx_model>.
+    pub sherpa_onnx_model_dir: Option<PathBuf>,
+    /// Sherpa ONNX execution provider: "auto", "cpu", "coreml", or "cuda".
+    pub sherpa_onnx_provider: String,
+    /// Thread count for Sherpa ONNX neural network computation.
+    pub sherpa_onnx_num_threads: i32,
 }
 
 pub const VALID_PARAKEET_MODELS: &[&str] = &["tdt-ctc-110m", "tdt-600m"];
 pub const DEFAULT_MLX_AUDIO_MODEL: &str = "mlx-community/Qwen3-ASR-1.7B-8bit";
+pub const DEFAULT_SHERPA_ONNX_MODEL: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+pub const DEFAULT_SHERPA_ONNX_PROVIDER: &str = "auto";
+pub const DEFAULT_SHERPA_ONNX_NUM_THREADS: i32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -923,6 +935,10 @@ impl Default for TranscriptionConfig {
             mlx_audio_warm: true,
             mlx_audio_timeout_secs: 1800,
             mlx_audio_chunk_secs: 30.0,
+            sherpa_onnx_model: DEFAULT_SHERPA_ONNX_MODEL.into(),
+            sherpa_onnx_model_dir: None,
+            sherpa_onnx_provider: DEFAULT_SHERPA_ONNX_PROVIDER.into(),
+            sherpa_onnx_num_threads: DEFAULT_SHERPA_ONNX_NUM_THREADS,
         }
     }
 }
@@ -1461,6 +1477,19 @@ mod tests {
         assert!(config.transcription.mlx_audio_warm);
         assert_eq!(config.transcription.mlx_audio_timeout_secs, 1800);
         assert_eq!(config.transcription.mlx_audio_chunk_secs, 30.0);
+        assert_eq!(
+            config.transcription.sherpa_onnx_model,
+            DEFAULT_SHERPA_ONNX_MODEL
+        );
+        assert!(config.transcription.sherpa_onnx_model_dir.is_none());
+        assert_eq!(
+            config.transcription.sherpa_onnx_provider,
+            DEFAULT_SHERPA_ONNX_PROVIDER
+        );
+        assert_eq!(
+            config.transcription.sherpa_onnx_num_threads,
+            DEFAULT_SHERPA_ONNX_NUM_THREADS
+        );
         assert_eq!(config.diarization.engine, "auto");
         assert_eq!(config.summarization.engine, "none");
         assert_eq!(config.search.engine, "builtin");

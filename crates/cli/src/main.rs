@@ -9,7 +9,10 @@ use minutes_core::autoresearch::{
     DecodeHintEvalComparisonRequest, DecodeHintEvalOptions, DecodeHintEvalRequest,
 };
 use minutes_core::capture::RecordingIntent;
-use minutes_core::config::{ConsentMode, DEFAULT_MLX_AUDIO_MODEL, VALID_PARAKEET_MODELS};
+use minutes_core::config::{
+    ConsentMode, DEFAULT_MLX_AUDIO_MODEL, DEFAULT_SHERPA_ONNX_MODEL,
+    DEFAULT_SHERPA_ONNX_NUM_THREADS, DEFAULT_SHERPA_ONNX_PROVIDER, VALID_PARAKEET_MODELS,
+};
 use minutes_core::markdown::ConsentBasis;
 use minutes_core::parakeet;
 use minutes_core::{CaptureMode, Config, ContentType};
@@ -780,6 +783,22 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_MLX_AUDIO_MODEL)]
         mlx_audio_model: String,
 
+        /// Download Sherpa ONNX Parakeet model and select it as the transcription engine
+        #[arg(long)]
+        sherpa_onnx: bool,
+
+        /// Sherpa ONNX model package to configure
+        #[arg(long, default_value = DEFAULT_SHERPA_ONNX_MODEL)]
+        sherpa_onnx_model: String,
+
+        /// Sherpa ONNX provider: auto, cpu, coreml, or cuda
+        #[arg(long, default_value = DEFAULT_SHERPA_ONNX_PROVIDER, value_parser = ["auto", "cpu", "coreml", "cuda"])]
+        sherpa_onnx_provider: String,
+
+        /// Sherpa ONNX thread count for neural network computation
+        #[arg(long, default_value_t = DEFAULT_SHERPA_ONNX_NUM_THREADS)]
+        sherpa_onnx_num_threads: i32,
+
         /// Install the bundled 5-meeting fixture corpus for demoing search, graph, and MCP flows
         #[arg(long)]
         demo: bool,
@@ -790,6 +809,13 @@ enum Commands {
     MlxAudio {
         #[command(subcommand)]
         action: MlxAudioAction,
+    },
+
+    /// Inspect or benchmark experimental Sherpa ONNX model compatibility
+    #[command(name = "sherpa-onnx")]
+    SherpaOnnx {
+        #[command(subcommand)]
+        action: SherpaOnnxAction,
     },
 
     /// Inspect or register the meetings directory as a QMD collection
@@ -1151,6 +1177,43 @@ enum MlxAudioAction {
         /// Flow to check compatibility for
         #[arg(long, default_value = "batch", value_parser = ["batch", "live", "dictation"])]
         flow: String,
+
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SherpaOnnxAction {
+    /// Run one audio file through Sherpa ONNX and report output shape
+    Probe {
+        /// Audio file to transcribe for the probe
+        #[arg(long)]
+        audio: PathBuf,
+
+        /// Flow to check compatibility for
+        #[arg(long, default_value = "batch", value_parser = ["batch", "benchmark"])]
+        flow: String,
+
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run repeated Sherpa ONNX decodes and report latency/RTF
+    Benchmark {
+        /// Audio file to transcribe for the benchmark
+        #[arg(long)]
+        audio: PathBuf,
+
+        /// Number of warm decode runs after forcing one cold load
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+
+        /// Provider override for this benchmark
+        #[arg(long, default_value = DEFAULT_SHERPA_ONNX_PROVIDER, value_parser = ["auto", "cpu", "coreml", "cuda"])]
+        provider: String,
 
         /// Output raw JSON instead of formatted text
         #[arg(long)]
@@ -1730,10 +1793,20 @@ fn main() -> Result<()> {
             parakeet_model,
             mlx_audio,
             mlx_audio_model,
+            sherpa_onnx,
+            sherpa_onnx_model,
+            sherpa_onnx_provider,
+            sherpa_onnx_num_threads,
             demo,
         } => {
             if demo {
                 cmd_setup_demo()
+            } else if sherpa_onnx {
+                cmd_setup_sherpa_onnx(
+                    &sherpa_onnx_model,
+                    &sherpa_onnx_provider,
+                    sherpa_onnx_num_threads,
+                )
             } else if mlx_audio {
                 cmd_setup_mlx_audio(&mlx_audio_model)
             } else if parakeet {
@@ -1743,6 +1816,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::MlxAudio { action } => cmd_mlx_audio(action, &config),
+        Commands::SherpaOnnx { action } => cmd_sherpa_onnx(action, &config),
         Commands::Qmd { action, collection } => cmd_qmd(&action, &collection, &config),
         Commands::Automate {
             kind,
@@ -5702,6 +5776,342 @@ fn cmd_mlx_audio_probe(
     Ok(())
 }
 
+#[cfg(feature = "sherpa-onnx")]
+fn cmd_setup_sherpa_onnx(model: &str, provider: &str, num_threads: i32) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        anyhow::bail!("sherpa-onnx model cannot be empty");
+    }
+    let provider_plan = minutes_core::sherpa_onnx::provider_plan(provider)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let archive_url = minutes_core::sherpa_onnx::model_archive_url(model).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown sherpa-onnx model `{}`; v1 supports `{}`",
+            model,
+            DEFAULT_SHERPA_ONNX_MODEL
+        )
+    })?;
+
+    let mut config = Config::load();
+    config.transcription.sherpa_onnx_model = model.into();
+    config.transcription.sherpa_onnx_model_dir = None;
+    let model_dir = minutes_core::sherpa_onnx::resolve_model_dir(&config);
+    let install_root = model_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid Sherpa ONNX model directory"))?
+        .to_path_buf();
+    std::fs::create_dir_all(&install_root)?;
+
+    match minutes_core::sherpa_onnx::validate_model_dir(model, &model_dir) {
+        Ok(()) => {
+            eprintln!("Sherpa ONNX model already set up: {}", model_dir.display());
+        }
+        Err(_) => {
+            let archive_name = archive_url
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("sherpa-onnx-model.tar.bz2");
+            let archive_path = install_root.join(archive_name);
+            eprintln!("Downloading Sherpa ONNX model: {model}");
+            download_file(archive_url, &archive_path)?;
+            eprintln!("Extracting Sherpa ONNX model...");
+            extract_tar_bz2_safely(&archive_path, &install_root)?;
+            minutes_core::sherpa_onnx::validate_model_dir(model, &model_dir)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+    }
+
+    config.transcription.engine = "sherpa-onnx".into();
+    config.transcription.sherpa_onnx_model = model.into();
+    config.transcription.sherpa_onnx_provider = provider_plan.requested_provider;
+    config.transcription.sherpa_onnx_num_threads = if num_threads <= 0 {
+        DEFAULT_SHERPA_ONNX_NUM_THREADS
+    } else {
+        num_threads
+    };
+    config
+        .save()
+        .map_err(|e| anyhow::anyhow!("failed to save config: {}", e))?;
+
+    eprintln!();
+    eprintln!("Sherpa ONNX configured for saved-audio transcription and benchmarking.");
+    eprintln!("  Config:   {}", Config::config_path().display());
+    eprintln!("  Model:    {}", model);
+    eprintln!("  Path:     {}", model_dir.display());
+    eprintln!("  Provider: {}", config.transcription.sherpa_onnx_provider);
+    eprintln!(
+        "  Threads:  {}",
+        config.transcription.sherpa_onnx_num_threads
+    );
+    eprintln!();
+    eprintln!("Probe before using saved meeting transcripts:");
+    eprintln!("  minutes sherpa-onnx probe --audio sample.wav --flow batch");
+    eprintln!("Benchmark with a provider override:");
+    eprintln!("  minutes sherpa-onnx benchmark --audio sample.wav --runs 3 --provider cpu --json");
+
+    Ok(())
+}
+
+#[cfg(not(feature = "sherpa-onnx"))]
+fn cmd_setup_sherpa_onnx(_model: &str, _provider: &str, _num_threads: i32) -> Result<()> {
+    anyhow::bail!(
+        "Sherpa ONNX support is not compiled in. Rebuild with `cargo build --features sherpa-onnx`."
+    );
+}
+
+#[cfg(feature = "sherpa-onnx")]
+fn extract_tar_bz2_safely(archive_path: &Path, dest_root: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = bzip2::read::BzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            anyhow::bail!(
+                "refusing to extract link from Sherpa ONNX archive: {}",
+                entry.path()?.display()
+            );
+        }
+        let safe_path = safe_archive_path(entry.path()?.as_ref())?;
+        if safe_path.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = dest_root.join(safe_path);
+        entry.unpack(&dest)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sherpa-onnx")]
+fn safe_archive_path(path: &Path) -> Result<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => safe.push(part),
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!(
+                "refusing to extract unsafe Sherpa ONNX archive path: {}",
+                path.display()
+            ),
+        }
+    }
+    Ok(safe)
+}
+
+fn cmd_sherpa_onnx(action: SherpaOnnxAction, config: &Config) -> Result<()> {
+    match action {
+        SherpaOnnxAction::Probe { audio, flow, json } => {
+            cmd_sherpa_onnx_probe(&audio, &flow, json, config)
+        }
+        SherpaOnnxAction::Benchmark {
+            audio,
+            runs,
+            provider,
+            json,
+        } => cmd_sherpa_onnx_benchmark(&audio, runs, &provider, json, config),
+    }
+}
+
+fn cmd_sherpa_onnx_probe(audio: &Path, flow: &str, json: bool, config: &Config) -> Result<()> {
+    let mut config = config.clone();
+    config.transcription.engine = "sherpa-onnx".into();
+
+    let report = minutes_core::sherpa_onnx::probe(audio, &config)
+        .map_err(|error| anyhow::anyhow!("Sherpa ONNX probe failed: {error}"))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_envelope("sherpa-onnx probe", &report))?
+        );
+    } else {
+        print!("{}", format_sherpa_onnx_probe_report(&report, flow));
+    }
+
+    if !sherpa_onnx_probe_flow_compatible(&report, flow) {
+        anyhow::bail!("{}", sherpa_onnx_probe_flow_error(flow, &report));
+    }
+
+    Ok(())
+}
+
+fn cmd_sherpa_onnx_benchmark(
+    audio: &Path,
+    runs: usize,
+    provider: &str,
+    json: bool,
+    config: &Config,
+) -> Result<()> {
+    let mut config = config.clone();
+    config.transcription.engine = "sherpa-onnx".into();
+    config.transcription.sherpa_onnx_provider = provider.into();
+
+    let report = minutes_core::sherpa_onnx::benchmark(audio, &config, runs)
+        .map_err(|error| anyhow::anyhow!("Sherpa ONNX benchmark failed: {error}"))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_envelope("sherpa-onnx benchmark", &report))?
+        );
+    } else {
+        print!("{}", format_sherpa_onnx_benchmark_report(&report));
+    }
+
+    Ok(())
+}
+
+fn sherpa_onnx_probe_flow_compatible(
+    report: &minutes_core::sherpa_onnx::SherpaOnnxProbeReport,
+    flow: &str,
+) -> bool {
+    match flow {
+        "batch" => report.batch_compatible,
+        "benchmark" => report.benchmark_compatible,
+        _ => false,
+    }
+}
+
+fn sherpa_onnx_probe_flow_error(
+    flow: &str,
+    report: &minutes_core::sherpa_onnx::SherpaOnnxProbeReport,
+) -> String {
+    match flow {
+        "batch" => format!(
+            "Sherpa ONNX model `{}` is not compatible with saved meeting transcripts in this run: batch processing requires real token timestamps.",
+            report.model
+        ),
+        "benchmark" => format!(
+            "Sherpa ONNX model `{}` did not return transcript text in this run, so it cannot be benchmarked meaningfully.",
+            report.model
+        ),
+        _ => format!("unknown Sherpa ONNX probe flow: {flow}"),
+    }
+}
+
+fn format_sherpa_onnx_probe_report(
+    report: &minutes_core::sherpa_onnx::SherpaOnnxProbeReport,
+    flow: &str,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let selected = if sherpa_onnx_probe_flow_compatible(report, flow) {
+        "compatible"
+    } else {
+        "not compatible"
+    };
+
+    writeln!(output, "Sherpa ONNX model probe").unwrap();
+    writeln!(output, "  Model: {}", report.model).unwrap();
+    writeln!(output, "  Audio: {}", report.audio_path).unwrap();
+    writeln!(
+        output,
+        "  Provider: {} -> {}",
+        report.requested_provider, report.resolved_provider
+    )
+    .unwrap();
+    writeln!(output, "  Threads: {}", report.num_threads).unwrap();
+    writeln!(output, "  Selected flow: {flow} ({selected})").unwrap();
+    writeln!(output).unwrap();
+    writeln!(output, "Compatibility").unwrap();
+    writeln!(
+        output,
+        "  Saved meeting transcripts: {}",
+        yes_no(report.batch_compatible)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Benchmarking: {}",
+        yes_no(report.benchmark_compatible)
+    )
+    .unwrap();
+    writeln!(output).unwrap();
+    writeln!(output, "Output shape").unwrap();
+    writeln!(output, "  Text chars: {}", report.text_chars).unwrap();
+    writeln!(output, "  Tokens: {}", report.tokens).unwrap();
+    writeln!(output, "  Token timestamps: {}", report.token_timestamps).unwrap();
+    writeln!(output, "  Timed segments: {}", report.timed_segments).unwrap();
+    writeln!(output).unwrap();
+    writeln!(output, "Timing").unwrap();
+    writeln!(
+        output,
+        "  Audio duration: {:.2}s",
+        report.audio_duration_secs
+    )
+    .unwrap();
+    writeln!(output, "  Inference: {} ms", report.stats.inference_ms).unwrap();
+    if let Some(cold_load_ms) = report.stats.cold_load_ms {
+        writeln!(output, "  Cold load: {cold_load_ms} ms").unwrap();
+    }
+    writeln!(output, "  RTF: {:.3}", report.stats.rtf).unwrap();
+    if !report.text_preview.is_empty() {
+        writeln!(output).unwrap();
+        writeln!(output, "Preview").unwrap();
+        writeln!(output, "  {}", report.text_preview).unwrap();
+    }
+    if !report.notes.is_empty() {
+        writeln!(output).unwrap();
+        writeln!(output, "Notes").unwrap();
+        for note in &report.notes {
+            writeln!(output, "  - {note}").unwrap();
+        }
+    }
+
+    output
+}
+
+fn format_sherpa_onnx_benchmark_report(
+    report: &minutes_core::sherpa_onnx::SherpaOnnxBenchmarkReport,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    writeln!(output, "Sherpa ONNX benchmark").unwrap();
+    writeln!(output, "  Model: {}", report.model).unwrap();
+    writeln!(output, "  Audio: {}", report.audio_path).unwrap();
+    writeln!(
+        output,
+        "  Provider: {} -> {}",
+        report.requested_provider, report.resolved_provider
+    )
+    .unwrap();
+    writeln!(output, "  Threads: {}", report.num_threads).unwrap();
+    writeln!(
+        output,
+        "  Saved transcript compatible: {}",
+        yes_no(report.batch_compatible)
+    )
+    .unwrap();
+    if let Some(reason) = &report.fallback_reason {
+        writeln!(output, "  Fallback: {reason}").unwrap();
+    }
+    if let Some(cold_load_ms) = report.cold_load_ms {
+        writeln!(output, "  Cold load: {cold_load_ms} ms").unwrap();
+    }
+    writeln!(output).unwrap();
+    writeln!(output, "Runs").unwrap();
+    for run in &report.runs {
+        writeln!(
+            output,
+            "  #{}: {} ms, RTF {:.3}, text chars {}, tokens {}, timed segments {}",
+            run.run, run.elapsed_ms, run.rtf, run.text_chars, run.tokens, run.timed_segments
+        )
+        .unwrap();
+    }
+    writeln!(output).unwrap();
+    writeln!(
+        output,
+        "Average: {:.1} ms, RTF {:.3}",
+        report.avg_elapsed_ms, report.avg_rtf
+    )
+    .unwrap();
+    output
+}
+
 fn mlx_audio_probe_flow_compatible(
     report: &minutes_core::mlx_audio::MlxAudioProbeReport,
     flow: &str,
@@ -7117,6 +7527,40 @@ mod tests {
     }
 
     #[test]
+    fn setup_clap_accepts_sherpa_onnx_flags() {
+        let parsed = Cli::try_parse_from([
+            "minutes",
+            "setup",
+            "--sherpa-onnx",
+            "--sherpa-onnx-provider",
+            "cpu",
+            "--sherpa-onnx-num-threads",
+            "2",
+        ])
+        .expect("setup --sherpa-onnx must parse");
+
+        match parsed.command {
+            Commands::Setup {
+                sherpa_onnx,
+                sherpa_onnx_model,
+                sherpa_onnx_provider,
+                sherpa_onnx_num_threads,
+                mlx_audio,
+                parakeet,
+                ..
+            } => {
+                assert!(sherpa_onnx);
+                assert!(!mlx_audio);
+                assert!(!parakeet);
+                assert_eq!(sherpa_onnx_model, DEFAULT_SHERPA_ONNX_MODEL);
+                assert_eq!(sherpa_onnx_provider, "cpu");
+                assert_eq!(sherpa_onnx_num_threads, 2);
+            }
+            _ => panic!("expected setup command"),
+        }
+    }
+
+    #[test]
     fn mlx_audio_probe_clap_accepts_flags() {
         let parsed = Cli::try_parse_from([
             "minutes",
@@ -7152,6 +7596,67 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected mlx-audio probe command"),
+        }
+    }
+
+    #[test]
+    fn sherpa_onnx_probe_clap_accepts_flags() {
+        let parsed = Cli::try_parse_from([
+            "minutes",
+            "sherpa-onnx",
+            "probe",
+            "--audio",
+            "audio.wav",
+            "--flow",
+            "benchmark",
+            "--json",
+        ])
+        .expect("sherpa-onnx probe must parse");
+
+        match parsed.command {
+            Commands::SherpaOnnx {
+                action: SherpaOnnxAction::Probe { audio, flow, json },
+            } => {
+                assert_eq!(audio, PathBuf::from("audio.wav"));
+                assert_eq!(flow, "benchmark");
+                assert!(json);
+            }
+            _ => panic!("expected sherpa-onnx probe command"),
+        }
+    }
+
+    #[test]
+    fn sherpa_onnx_benchmark_clap_accepts_flags() {
+        let parsed = Cli::try_parse_from([
+            "minutes",
+            "sherpa-onnx",
+            "benchmark",
+            "--audio",
+            "audio.wav",
+            "--runs",
+            "5",
+            "--provider",
+            "cpu",
+            "--json",
+        ])
+        .expect("sherpa-onnx benchmark must parse");
+
+        match parsed.command {
+            Commands::SherpaOnnx {
+                action:
+                    SherpaOnnxAction::Benchmark {
+                        audio,
+                        runs,
+                        provider,
+                        json,
+                    },
+            } => {
+                assert_eq!(audio, PathBuf::from("audio.wav"));
+                assert_eq!(runs, 5);
+                assert_eq!(provider, "cpu");
+                assert!(json);
+            }
+            _ => panic!("expected sherpa-onnx benchmark command"),
         }
     }
 
