@@ -31,6 +31,7 @@ engine = "sherpa-onnx"
 sherpa_onnx_model = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 sherpa_onnx_provider = "auto"
 sherpa_onnx_num_threads = 4
+sherpa_onnx_live_mode = "utterance"
 ```
 
 `auto` tries a local accelerated provider first and falls back to CPU:
@@ -71,8 +72,33 @@ Benchmark output includes requested provider, resolved provider, fallback reason
 cold load time, per-run decode time, RTF, text length, token count, and whether
 the result shape is compatible with saved meeting transcripts.
 
+## Live and Dictation
+
+Sherpa ONNX can be used for finalized online utterances when the binary is
+built with `--features sherpa-onnx`. This uses the same warm offline recognizer
+as probe/benchmark and does not require token timestamps:
+
+```toml
+[transcription]
+engine = "sherpa-onnx"
+sherpa_onnx_live_mode = "utterance"
+
+[live_transcript]
+backend = "inherit" # or "sherpa-onnx"
+
+[dictation]
+backend = "sherpa-onnx"
+```
+
+Whisper still produces dictation partials in this mode. Sherpa replaces only
+the final text for each utterance. If the Sherpa feature, model, or provider is
+unavailable during live transcript or dictation, Minutes disables Sherpa for
+that session, warns once for that source, and falls back to Whisper.
+
 ## Scope
 
-This first slice is batch/probe/benchmark only. Live transcript, dictation, and
-desktop settings UI support are intentionally deferred until the ONNX output
-shape and performance are proven on real recordings.
+V1 supports saved-audio batch/probe/benchmark plus finalized live/dictation
+utterances. True streaming partials are intentionally deferred: they should use
+Sherpa's `OnlineRecognizer` with a streaming model profile, such as
+`sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20`, not the offline
+Nemo Parakeet TDT package above.

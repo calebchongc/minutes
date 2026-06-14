@@ -105,12 +105,20 @@ pub const MLX_AUDIO_SCOPE_DOC_REF: &str = "docs/MLX_AUDIO.md";
 pub const MLX_AUDIO_LIVE_FALLBACK_WARNING: &str =
     "mlx-audio live transcription failed; falling back to whisper for this session";
 
+pub const SHERPA_ONNX_SCOPE_DOC_REF: &str = "docs/SHERPA_ONNX.md";
+pub const SHERPA_ONNX_LIVE_SCOPE_WARNING: &str =
+    "this build does not include sherpa-onnx; live transcription uses whisper (see docs/SHERPA_ONNX.md)";
+pub const SHERPA_ONNX_LIVE_FALLBACK_WARNING: &str =
+    "sherpa-onnx live transcription failed; falling back to whisper for this session";
+
 /// True iff this build can route `engine = "parakeet"` to the parakeet path.
 /// Used at session start to decide between scope-warning (compile-time gap)
 /// and the real parakeet dispatch.
 fn live_engine_scope_warning(engine: &str) -> Option<&'static str> {
     if engine.eq_ignore_ascii_case("parakeet") && !live_supports_parakeet(engine) {
         Some(PARAKEET_LIVE_SCOPE_WARNING)
+    } else if engine.eq_ignore_ascii_case("sherpa-onnx") && !live_supports_sherpa_onnx(engine) {
+        Some(SHERPA_ONNX_LIVE_SCOPE_WARNING)
     } else if engine.eq_ignore_ascii_case("apple-speech") && !live_supports_apple_speech() {
         Some(APPLE_SPEECH_LIVE_SCOPE_WARNING)
     } else {
@@ -125,6 +133,19 @@ fn live_supports_parakeet(engine: &str) -> bool {
     }
 
     #[cfg(not(feature = "parakeet"))]
+    {
+        let _ = engine;
+        false
+    }
+}
+
+fn live_supports_sherpa_onnx(engine: &str) -> bool {
+    #[cfg(feature = "sherpa-onnx")]
+    {
+        engine.eq_ignore_ascii_case("sherpa-onnx")
+    }
+
+    #[cfg(not(feature = "sherpa-onnx"))]
     {
         let _ = engine;
         false
@@ -173,6 +194,13 @@ fn emit_live_engine_scope_warning(engine: &str, source: &'static str) {
     let Some(message) = live_engine_scope_warning(engine) else {
         return;
     };
+    let doc_ref = if engine.eq_ignore_ascii_case("sherpa-onnx") {
+        SHERPA_ONNX_SCOPE_DOC_REF
+    } else if engine.eq_ignore_ascii_case("apple-speech") {
+        APPLE_SPEECH_SCOPE_DOC_REF
+    } else {
+        PARAKEET_SCOPE_DOC_REF
+    };
 
     eprintln!("[minutes] {}", message);
     tracing::warn!(engine, source, "{}", message);
@@ -185,7 +213,7 @@ fn emit_live_engine_scope_warning(engine: &str, source: &'static str) {
         "extra": {
             "engine": engine,
             "source": source,
-            "doc_ref": PARAKEET_SCOPE_DOC_REF,
+            "doc_ref": doc_ref,
         }
     }))
     .ok();
@@ -233,6 +261,27 @@ fn emit_mlx_audio_fallback_warning(source: &'static str, detail: &str) {
             "source": source,
             "detail": detail,
             "doc_ref": MLX_AUDIO_SCOPE_DOC_REF,
+        }
+    }))
+    .ok();
+}
+
+fn emit_sherpa_onnx_fallback_warning(source: &'static str, detail: &str) {
+    eprintln!(
+        "[minutes] {} (detail: {})",
+        SHERPA_ONNX_LIVE_FALLBACK_WARNING, detail
+    );
+    tracing::warn!(source, detail, "{}", SHERPA_ONNX_LIVE_FALLBACK_WARNING);
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "live_transcript_sherpa_onnx_fallback",
+        "file": "",
+        "message": SHERPA_ONNX_LIVE_FALLBACK_WARNING,
+        "extra": {
+            "source": source,
+            "detail": detail,
+            "doc_ref": SHERPA_ONNX_SCOPE_DOC_REF,
         }
     }))
     .ok();
@@ -754,6 +803,8 @@ fn run_inner(
     let parakeet_fallback_ready = false;
     let mut mlx_audio_utterance_samples: Vec<f32> = Vec::new();
     let mut mlx_audio_live_enabled = standalone_backend.eq_ignore_ascii_case("mlx-audio");
+    let mut sherpa_onnx_utterance_samples: Vec<f32> = Vec::new();
+    let mut sherpa_onnx_live_enabled = live_supports_sherpa_onnx(standalone_backend);
 
     let mut was_speaking = false;
     let mut utterance_samples: usize = 0;
@@ -766,6 +817,9 @@ fn run_inner(
         emit_live_engine_scope_warning(standalone_backend, "standalone");
     }
     if standalone_backend.eq_ignore_ascii_case("apple-speech") && !apple_live_enabled {
+        emit_live_engine_scope_warning(standalone_backend, "standalone");
+    }
+    if standalone_backend.eq_ignore_ascii_case("sherpa-onnx") && !sherpa_onnx_live_enabled {
         emit_live_engine_scope_warning(standalone_backend, "standalone");
     }
     if apple_live_enabled {
@@ -836,6 +890,8 @@ fn run_inner(
                     &mut parakeet_utterance_samples,
                     &mut mlx_audio_live_enabled,
                     &mut mlx_audio_utterance_samples,
+                    &mut sherpa_onnx_live_enabled,
+                    &mut sherpa_onnx_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -850,6 +906,8 @@ fn run_inner(
                     parakeet_fallback_ready,
                     &mut mlx_audio_live_enabled,
                     &mut mlx_audio_utterance_samples,
+                    &mut sherpa_onnx_live_enabled,
+                    &mut sherpa_onnx_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -873,6 +931,8 @@ fn run_inner(
                     &mut parakeet_utterance_samples,
                     &mut mlx_audio_live_enabled,
                     &mut mlx_audio_utterance_samples,
+                    &mut sherpa_onnx_live_enabled,
+                    &mut sherpa_onnx_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -887,6 +947,8 @@ fn run_inner(
                     parakeet_fallback_ready,
                     &mut mlx_audio_live_enabled,
                     &mut mlx_audio_utterance_samples,
+                    &mut sherpa_onnx_live_enabled,
+                    &mut sherpa_onnx_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -925,6 +987,7 @@ fn run_inner(
                     #[cfg(feature = "parakeet")]
                     parakeet_utterance_samples.clear();
                     mlx_audio_utterance_samples.clear();
+                    sherpa_onnx_utterance_samples.clear();
                     utterance_samples = 0;
                     was_speaking = false;
                     continue;
@@ -943,6 +1006,8 @@ fn run_inner(
                             &mut parakeet_utterance_samples,
                             &mut mlx_audio_live_enabled,
                             &mut mlx_audio_utterance_samples,
+                            &mut sherpa_onnx_live_enabled,
+                            &mut sherpa_onnx_utterance_samples,
                             config,
                             &mut streaming,
                             &mut whisper_ctx,
@@ -957,6 +1022,8 @@ fn run_inner(
                             parakeet_fallback_ready,
                             &mut mlx_audio_live_enabled,
                             &mut mlx_audio_utterance_samples,
+                            &mut sherpa_onnx_live_enabled,
+                            &mut sherpa_onnx_utterance_samples,
                             config,
                             &mut streaming,
                             &mut whisper_ctx,
@@ -1001,6 +1068,7 @@ fn run_inner(
                         #[cfg(feature = "parakeet")]
                         parakeet_utterance_samples.clear();
                         mlx_audio_utterance_samples.clear();
+                        sherpa_onnx_utterance_samples.clear();
                         utterance_samples = 0;
                         was_speaking = false;
                         continue;
@@ -1019,6 +1087,8 @@ fn run_inner(
                                 &mut parakeet_utterance_samples,
                                 &mut mlx_audio_live_enabled,
                                 &mut mlx_audio_utterance_samples,
+                                &mut sherpa_onnx_live_enabled,
+                                &mut sherpa_onnx_utterance_samples,
                                 config,
                                 &mut streaming,
                                 &mut whisper_ctx,
@@ -1033,6 +1103,8 @@ fn run_inner(
                                 parakeet_fallback_ready,
                                 &mut mlx_audio_live_enabled,
                                 &mut mlx_audio_utterance_samples,
+                                &mut sherpa_onnx_live_enabled,
+                                &mut sherpa_onnx_utterance_samples,
                                 config,
                                 &mut streaming,
                                 &mut whisper_ctx,
@@ -1066,6 +1138,8 @@ fn run_inner(
                 }
             } else if mlx_audio_live_enabled {
                 mlx_audio_utterance_samples.extend_from_slice(&chunk.samples);
+            } else if sherpa_onnx_live_enabled {
+                sherpa_onnx_utterance_samples.extend_from_slice(&chunk.samples);
             } else if let Ok(whisper_ctx) = ensure_live_whisper_ctx(&mut whisper_ctx, config) {
                 if let Some(_sr) = streaming.feed(&chunk.samples, whisper_ctx) {
                     // Intentionally not emitted in event-bus v0. Partial
@@ -1087,6 +1161,8 @@ fn run_inner(
                     &mut parakeet_utterance_samples,
                     &mut mlx_audio_live_enabled,
                     &mut mlx_audio_utterance_samples,
+                    &mut sherpa_onnx_live_enabled,
+                    &mut sherpa_onnx_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -1101,6 +1177,8 @@ fn run_inner(
                     parakeet_fallback_ready,
                     &mut mlx_audio_live_enabled,
                     &mut mlx_audio_utterance_samples,
+                    &mut sherpa_onnx_live_enabled,
+                    &mut sherpa_onnx_utterance_samples,
                     config,
                     &mut streaming,
                     &mut whisper_ctx,
@@ -1126,6 +1204,8 @@ fn run_inner(
                 &mut parakeet_utterance_samples,
                 &mut mlx_audio_live_enabled,
                 &mut mlx_audio_utterance_samples,
+                &mut sherpa_onnx_live_enabled,
+                &mut sherpa_onnx_utterance_samples,
                 config,
                 &mut streaming,
                 &mut whisper_ctx,
@@ -1140,6 +1220,8 @@ fn run_inner(
                 parakeet_fallback_ready,
                 &mut mlx_audio_live_enabled,
                 &mut mlx_audio_utterance_samples,
+                &mut sherpa_onnx_live_enabled,
+                &mut sherpa_onnx_utterance_samples,
                 config,
                 &mut streaming,
                 &mut whisper_ctx,
@@ -1640,7 +1722,22 @@ fn transcribe_utterance_for_sidecar(
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
     parakeet_enabled: &mut bool,
     mlx_audio_enabled: &mut bool,
+    sherpa_onnx_enabled: &mut bool,
 ) -> Option<(String, f64)> {
+    if *sherpa_onnx_enabled {
+        match transcribe_with_sherpa_onnx_for_live_sidecar(samples, config) {
+            Ok(result) => return result,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live recording-sidecar sherpa-onnx path failed — switching this session to whisper"
+                );
+                *sherpa_onnx_enabled = false;
+                emit_sherpa_onnx_fallback_warning("recording-sidecar", &error.to_string());
+            }
+        }
+    }
+
     if *mlx_audio_enabled {
         match transcribe_with_mlx_audio_for_live_sidecar(samples, config) {
             Ok(result) => return result,
@@ -1746,6 +1843,19 @@ fn transcribe_with_mlx_audio_for_live_sidecar(
     config: &Config,
 ) -> Result<Option<(String, f64)>, MinutesError> {
     match crate::mlx_audio::transcribe_utterance(samples, config) {
+        Ok(Some(result)) => Ok(Some((result.text, result.duration_secs))),
+        Ok(None) => Ok(None),
+        Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_with_sherpa_onnx_for_live_sidecar(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<(String, f64)>, MinutesError> {
+    match crate::sherpa_onnx::transcribe_utterance(samples, config) {
         Ok(Some(result)) => Ok(Some((result.text, result.duration_secs))),
         Ok(None) => Ok(None),
         Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
@@ -1859,16 +1969,15 @@ where
     try_whisper()
 }
 
-/// Finalize one utterance via the active engine (apple-speech, parakeet, or whisper)
-/// and write the resulting JSONL line.
+/// Finalize one utterance via the active engine and write the resulting JSONL line.
 ///
 /// Returns `true` if the write succeeded (or there was no text to write) and the
 /// session should continue; `false` on JSONL write failure, which signals the
 /// caller to stop to prevent data loss.
 ///
-/// On apple/parakeet failure, the function automatically falls back to whisper
-/// for the accumulated samples and flips that engine flag to `false` so the
-/// remainder of the session uses whisper.
+/// On finalized-utterance backend failure, the function automatically falls
+/// back to whisper for the accumulated samples and flips that engine flag to
+/// `false` so the remainder of the session uses whisper.
 #[cfg(all(feature = "whisper", feature = "parakeet"))]
 #[allow(clippy::too_many_arguments)]
 fn finalize_live_utterance(
@@ -1880,6 +1989,8 @@ fn finalize_live_utterance(
     parakeet_utterance_samples: &mut Vec<f32>,
     mlx_audio_live_enabled: &mut bool,
     mlx_audio_utterance_samples: &mut Vec<f32>,
+    sherpa_onnx_live_enabled: &mut bool,
+    sherpa_onnx_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -1952,6 +2063,51 @@ fn finalize_live_utterance(
                     Err(_) => {}
                 }
                 apple_utterance_samples.clear();
+                return true;
+            }
+        }
+    }
+
+    if *sherpa_onnx_live_enabled {
+        match transcribe_with_sherpa_onnx_for_live_sidecar(sherpa_onnx_utterance_samples, config) {
+            Ok(Some((text, duration_secs))) => {
+                let ok = writer.write_utterance(&text, duration_secs);
+                sherpa_onnx_utterance_samples.clear();
+                return ok;
+            }
+            Ok(None) => {
+                sherpa_onnx_utterance_samples.clear();
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live sherpa-onnx path failed — switching this session to whisper"
+                );
+                *sherpa_onnx_live_enabled = false;
+                emit_sherpa_onnx_fallback_warning(source, &error.to_string());
+                match ensure_live_whisper_ctx(whisper_ctx, config) {
+                    Ok(whisper_ctx) => {
+                        if let Some((text, duration_secs)) =
+                            transcribe_with_whisper_for_live_sidecar(
+                                sherpa_onnx_utterance_samples,
+                                whisper_ctx,
+                                config.transcription.language.clone(),
+                            )
+                        {
+                            let ok = writer.write_utterance(&text, duration_secs);
+                            sherpa_onnx_utterance_samples.clear();
+                            return ok;
+                        }
+                    }
+                    Err(load_error) => {
+                        tracing::error!(
+                            error = %load_error,
+                            "failed to load whisper fallback after sherpa-onnx live failure"
+                        );
+                    }
+                }
+                sherpa_onnx_utterance_samples.clear();
                 return true;
             }
         }
@@ -2088,6 +2244,8 @@ fn finalize_on_exit(
     parakeet_utterance_samples: &mut Vec<f32>,
     mlx_audio_live_enabled: &mut bool,
     mlx_audio_utterance_samples: &mut Vec<f32>,
+    sherpa_onnx_live_enabled: &mut bool,
+    sherpa_onnx_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -2103,6 +2261,8 @@ fn finalize_on_exit(
         parakeet_utterance_samples,
         mlx_audio_live_enabled,
         mlx_audio_utterance_samples,
+        sherpa_onnx_live_enabled,
+        sherpa_onnx_utterance_samples,
         config,
         streaming,
         whisper_ctx,
@@ -2123,6 +2283,8 @@ fn finalize_live_utterance(
     _parakeet_fallback_ready: bool,
     mlx_audio_live_enabled: &mut bool,
     mlx_audio_utterance_samples: &mut Vec<f32>,
+    sherpa_onnx_live_enabled: &mut bool,
+    sherpa_onnx_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -2169,6 +2331,51 @@ fn finalize_live_utterance(
                     }
                 }
                 apple_utterance_samples.clear();
+                return true;
+            }
+        }
+    }
+
+    if *sherpa_onnx_live_enabled {
+        match transcribe_with_sherpa_onnx_for_live_sidecar(sherpa_onnx_utterance_samples, config) {
+            Ok(Some((text, duration_secs))) => {
+                let ok = writer.write_utterance(&text, duration_secs);
+                sherpa_onnx_utterance_samples.clear();
+                return ok;
+            }
+            Ok(None) => {
+                sherpa_onnx_utterance_samples.clear();
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live sherpa-onnx path failed — switching this session to whisper"
+                );
+                *sherpa_onnx_live_enabled = false;
+                emit_sherpa_onnx_fallback_warning(source, &error.to_string());
+                match ensure_live_whisper_ctx(whisper_ctx, config) {
+                    Ok(whisper_ctx) => {
+                        if let Some((text, duration_secs)) =
+                            transcribe_with_whisper_for_live_sidecar(
+                                sherpa_onnx_utterance_samples,
+                                whisper_ctx,
+                                config.transcription.language.clone(),
+                            )
+                        {
+                            let ok = writer.write_utterance(&text, duration_secs);
+                            sherpa_onnx_utterance_samples.clear();
+                            return ok;
+                        }
+                    }
+                    Err(load_error) => {
+                        tracing::error!(
+                            error = %load_error,
+                            "failed to load whisper fallback after sherpa-onnx live failure"
+                        );
+                    }
+                }
+                sherpa_onnx_utterance_samples.clear();
                 return true;
             }
         }
@@ -2250,6 +2457,8 @@ fn finalize_on_exit(
     parakeet_fallback_ready: bool,
     mlx_audio_live_enabled: &mut bool,
     mlx_audio_utterance_samples: &mut Vec<f32>,
+    sherpa_onnx_live_enabled: &mut bool,
+    sherpa_onnx_utterance_samples: &mut Vec<f32>,
     config: &Config,
     streaming: &mut StreamingWhisper,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
@@ -2263,6 +2472,8 @@ fn finalize_on_exit(
         parakeet_fallback_ready,
         mlx_audio_live_enabled,
         mlx_audio_utterance_samples,
+        sherpa_onnx_live_enabled,
+        sherpa_onnx_utterance_samples,
         config,
         streaming,
         whisper_ctx,
@@ -2347,6 +2558,7 @@ fn run_sidecar_inner_mpsc(
         .transcription
         .engine
         .eq_ignore_ascii_case("mlx-audio");
+    let sherpa_onnx_live_enabled = live_supports_sherpa_onnx(&config.transcription.engine);
     let mut was_speaking = false;
     let mut utterance: Vec<f32> = Vec::new();
     let mut gating_stats = SidecarGatingStats::default();
@@ -2354,6 +2566,14 @@ fn run_sidecar_inner_mpsc(
     let max_utterance_samples = (max_utterance_secs as usize).saturating_mul(16000);
 
     if config.transcription.engine.eq_ignore_ascii_case("parakeet") && !parakeet_live_enabled {
+        emit_live_engine_scope_warning(&config.transcription.engine, "recording-sidecar");
+    }
+    if config
+        .transcription
+        .engine
+        .eq_ignore_ascii_case("sherpa-onnx")
+        && !sherpa_onnx_live_enabled
+    {
         emit_live_engine_scope_warning(&config.transcription.engine, "recording-sidecar");
     }
     if config
@@ -2390,6 +2610,7 @@ fn run_sidecar_inner_mpsc(
             .spawn(move || {
                 let mut parakeet_enabled = parakeet_live_enabled;
                 let mut mlx_audio_enabled = mlx_audio_live_enabled;
+                let mut sherpa_onnx_enabled = sherpa_onnx_live_enabled;
                 // Loaded lazily on first whisper-path utterance: the load can
                 // take >10s for larger models, and doing it eagerly (worse, on
                 // the consumer thread, as before) dropped the first ~13s of
@@ -2409,6 +2630,7 @@ fn run_sidecar_inner_mpsc(
                         &mut whisper_ctx,
                         &mut parakeet_enabled,
                         &mut mlx_audio_enabled,
+                        &mut sherpa_onnx_enabled,
                     );
                     pending.fetch_sub(1, Ordering::Relaxed);
                     if let Some((text, duration_secs)) = result {
@@ -3025,6 +3247,7 @@ for line in sys.stdin:
         let mut whisper_ctx = None;
         let mut parakeet_enabled = false;
         let mut mlx_audio_enabled = true;
+        let mut sherpa_onnx_enabled = false;
 
         let result = transcribe_utterance_for_sidecar(
             &samples,
@@ -3032,6 +3255,7 @@ for line in sys.stdin:
             &mut whisper_ctx,
             &mut parakeet_enabled,
             &mut mlx_audio_enabled,
+            &mut sherpa_onnx_enabled,
         )
         .expect("sidecar result");
 
@@ -4092,7 +4316,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn live_scope_warning_only_applies_to_parakeet() {
+    fn live_scope_warning_only_applies_to_missing_optional_engines() {
         #[cfg(feature = "parakeet")]
         {
             assert_eq!(live_engine_scope_warning("parakeet"), None);
@@ -4107,6 +4331,22 @@ for line in sys.stdin:
             assert_eq!(
                 live_engine_scope_warning("PaRaKeEt"),
                 Some(PARAKEET_LIVE_SCOPE_WARNING)
+            );
+        }
+        #[cfg(feature = "sherpa-onnx")]
+        {
+            assert_eq!(live_engine_scope_warning("sherpa-onnx"), None);
+            assert_eq!(live_engine_scope_warning("ShErPa-OnNx"), None);
+        }
+        #[cfg(not(feature = "sherpa-onnx"))]
+        {
+            assert_eq!(
+                live_engine_scope_warning("sherpa-onnx"),
+                Some(SHERPA_ONNX_LIVE_SCOPE_WARNING)
+            );
+            assert_eq!(
+                live_engine_scope_warning("ShErPa-OnNx"),
+                Some(SHERPA_ONNX_LIVE_SCOPE_WARNING)
             );
         }
         assert_eq!(live_engine_scope_warning("whisper"), None);

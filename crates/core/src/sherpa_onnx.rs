@@ -23,6 +23,8 @@ const TOKENS_FILE: &str = "tokens.txt";
 const NEMO_TRANSDUCER_MODEL_TYPE: &str = "nemo_transducer";
 #[cfg(any(feature = "sherpa-onnx", test))]
 const MAX_SEGMENT_SECS: f64 = 30.0;
+#[cfg(any(feature = "sherpa-onnx", test))]
+const SHERPA_ONNX_UTTERANCE_MIN_SAMPLES: usize = 16_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SherpaOnnxModelProfile {
@@ -103,6 +105,12 @@ pub struct SherpaOnnxBenchmarkReport {
     pub avg_elapsed_ms: f64,
     pub avg_rtf: f64,
     pub batch_compatible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SherpaOnnxUtterance {
+    pub text: String,
+    pub duration_secs: f64,
 }
 
 #[cfg(any(feature = "sherpa-onnx", test))]
@@ -252,6 +260,13 @@ pub fn benchmark(
     benchmark_impl(audio_path, config, runs)
 }
 
+pub fn transcribe_utterance(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<SherpaOnnxUtterance>, TranscribeError> {
+    transcribe_utterance_impl(samples, config)
+}
+
 pub fn reset_warm_cache() {
     #[cfg(feature = "sherpa-onnx")]
     {
@@ -261,6 +276,14 @@ pub fn reset_warm_cache() {
             }
         }
     }
+}
+
+#[cfg(not(feature = "sherpa-onnx"))]
+fn transcribe_utterance_impl(
+    _samples: &[f32],
+    _config: &Config,
+) -> Result<Option<SherpaOnnxUtterance>, TranscribeError> {
+    Err(TranscribeError::EngineNotAvailable("sherpa-onnx".into()))
 }
 
 #[cfg(not(feature = "sherpa-onnx"))]
@@ -311,6 +334,34 @@ static RECOGNIZER_CACHE: OnceLock<Mutex<Option<CachedRecognizer>>> = OnceLock::n
 #[cfg(feature = "sherpa-onnx")]
 fn recognizer_cache() -> &'static Mutex<Option<CachedRecognizer>> {
     RECOGNIZER_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "sherpa-onnx")]
+fn transcribe_utterance_impl(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<SherpaOnnxUtterance>, TranscribeError> {
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+    if samples.len() < SHERPA_ONNX_UTTERANCE_MIN_SAMPLES {
+        return Ok(None);
+    }
+
+    let duration_secs = samples.len() as f64 / 16_000.0;
+    let outcome = decode_samples(samples, config)?;
+    let utterance = utterance_from_decode_result(&outcome.result, duration_secs);
+    if let Some(utterance) = &utterance {
+        tracing::info!(
+            engine = "sherpa-onnx",
+            requested_provider = outcome.requested_provider,
+            resolved_provider = outcome.resolved_provider,
+            inference_ms = outcome.inference_ms,
+            chars = utterance.text.chars().count(),
+            "sherpa-onnx finalized utterance complete"
+        );
+    }
+    Ok(utterance)
 }
 
 #[cfg(feature = "sherpa-onnx")]
@@ -727,6 +778,40 @@ fn timed_segments_from_decode_result(
 }
 
 #[cfg(any(feature = "sherpa-onnx", test))]
+fn utterance_from_decode_result(
+    result: &DecodeResult,
+    duration_secs: f64,
+) -> Option<SherpaOnnxUtterance> {
+    let text = text_from_decode_result(result)?;
+    Some(SherpaOnnxUtterance {
+        text,
+        duration_secs,
+    })
+}
+
+#[cfg(any(feature = "sherpa-onnx", test))]
+fn text_from_decode_result(result: &DecodeResult) -> Option<String> {
+    let direct = normalize_joined_text(&result.text);
+    if !direct.is_empty() {
+        return Some(direct);
+    }
+
+    let joined_tokens = result
+        .tokens
+        .iter()
+        .map(|token| normalize_token_text(token))
+        .filter(|token| !token.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("");
+    let joined_tokens = normalize_joined_text(&joined_tokens);
+    if joined_tokens.is_empty() {
+        None
+    } else {
+        Some(joined_tokens)
+    }
+}
+
+#[cfg(any(feature = "sherpa-onnx", test))]
 #[derive(Debug, Clone)]
 struct TimedToken {
     start_secs: f64,
@@ -830,6 +915,57 @@ mod tests {
 
         let error = timed_segments_from_decode_result(&result).unwrap_err();
         assert!(error.contains("missing token timestamps"));
+    }
+
+    #[test]
+    fn text_only_result_is_accepted_for_finalized_utterance() {
+        let result = DecodeResult {
+            text: " hello   world ".into(),
+            tokens: Vec::new(),
+            timestamps: None,
+            durations: None,
+        };
+
+        let utterance = utterance_from_decode_result(&result, 1.25).unwrap();
+        assert_eq!(utterance.text, "hello world");
+        assert_eq!(utterance.duration_secs, 1.25);
+    }
+
+    #[test]
+    fn finalized_utterance_can_fall_back_to_tokens() {
+        let result = DecodeResult {
+            text: String::new(),
+            tokens: vec!["\u{2581}hello".into(), "\u{2581}world".into()],
+            timestamps: None,
+            durations: None,
+        };
+
+        let utterance = utterance_from_decode_result(&result, 2.0).unwrap();
+        assert_eq!(utterance.text, "hello world");
+        assert_eq!(utterance.duration_secs, 2.0);
+    }
+
+    #[test]
+    fn empty_result_is_not_a_finalized_utterance() {
+        let result = DecodeResult {
+            text: "   ".into(),
+            tokens: vec!["<blk>".into()],
+            timestamps: None,
+            durations: None,
+        };
+
+        assert_eq!(utterance_from_decode_result(&result, 1.0), None);
+    }
+
+    #[test]
+    #[cfg(not(feature = "sherpa-onnx"))]
+    fn utterance_returns_engine_not_available_without_feature() {
+        let samples = vec![0.0; SHERPA_ONNX_UTTERANCE_MIN_SAMPLES];
+        let error = transcribe_utterance(&samples, &Config::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            TranscribeError::EngineNotAvailable(engine) if engine == "sherpa-onnx"
+        ));
     }
 
     #[test]

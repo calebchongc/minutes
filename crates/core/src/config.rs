@@ -238,6 +238,9 @@ pub struct TranscriptionConfig {
     pub sherpa_onnx_provider: String,
     /// Thread count for Sherpa ONNX neural network computation.
     pub sherpa_onnx_num_threads: i32,
+    /// Sherpa ONNX live mode. V1 supports finalized utterance decoding; true
+    /// streaming partials require a streaming model profile and are opt-in later.
+    pub sherpa_onnx_live_mode: String,
 }
 
 pub const VALID_PARAKEET_MODELS: &[&str] = &["tdt-ctc-110m", "tdt-600m"];
@@ -245,6 +248,7 @@ pub const DEFAULT_MLX_AUDIO_MODEL: &str = "mlx-community/Qwen3-ASR-1.7B-8bit";
 pub const DEFAULT_SHERPA_ONNX_MODEL: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
 pub const DEFAULT_SHERPA_ONNX_PROVIDER: &str = "auto";
 pub const DEFAULT_SHERPA_ONNX_NUM_THREADS: i32 = 4;
+pub const DEFAULT_SHERPA_ONNX_LIVE_MODE: &str = "utterance";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -762,6 +766,7 @@ pub const VALID_LIVE_TRANSCRIPT_BACKENDS: &[&str] = &[
     "whisper",
     "parakeet",
     "mlx-audio",
+    "sherpa-onnx",
     "apple-speech",
 ];
 
@@ -939,6 +944,7 @@ impl Default for TranscriptionConfig {
             sherpa_onnx_model_dir: None,
             sherpa_onnx_provider: DEFAULT_SHERPA_ONNX_PROVIDER.into(),
             sherpa_onnx_num_threads: DEFAULT_SHERPA_ONNX_NUM_THREADS,
+            sherpa_onnx_live_mode: DEFAULT_SHERPA_ONNX_LIVE_MODE.into(),
         }
     }
 }
@@ -1490,6 +1496,10 @@ mod tests {
             config.transcription.sherpa_onnx_num_threads,
             DEFAULT_SHERPA_ONNX_NUM_THREADS
         );
+        assert_eq!(
+            config.transcription.sherpa_onnx_live_mode,
+            DEFAULT_SHERPA_ONNX_LIVE_MODE
+        );
         assert_eq!(config.diarization.engine, "auto");
         assert_eq!(config.summarization.engine, "none");
         assert_eq!(config.search.engine, "builtin");
@@ -1761,6 +1771,54 @@ backend = "mlx-audio"
     }
 
     #[test]
+    fn sherpa_onnx_live_transcript_backend_can_be_set_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transcription]
+engine = "whisper"
+
+[live_transcript]
+backend = "sherpa-onnx"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert_eq!(config.live_transcript.backend, "sherpa-onnx");
+        assert_eq!(config.effective_live_transcript_backend(), "sherpa-onnx");
+        assert_eq!(config.transcription.engine, "whisper");
+    }
+
+    #[test]
+    fn effective_live_transcript_backend_can_inherit_sherpa_onnx() {
+        let mut config = Config::default();
+        config.transcription.engine = "sherpa-onnx".into();
+
+        assert_eq!(config.standalone_live_backend_setting(), "inherit");
+        assert_eq!(config.effective_live_transcript_backend(), "sherpa-onnx");
+    }
+
+    #[test]
+    fn sherpa_onnx_live_mode_round_trips_through_toml() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transcription]
+sherpa_onnx_live_mode = "streaming"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert_eq!(config.transcription.sherpa_onnx_live_mode, "streaming");
+    }
+
+    #[test]
     fn parakeet_sidecar_flag_can_be_enabled_from_toml() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -1862,6 +1920,24 @@ backend = "mlx-audio"
 
         let config = Config::load_from(&config_path);
         assert_eq!(config.dictation.backend, "mlx-audio");
+        assert_eq!(config.transcription.engine, "whisper");
+    }
+
+    #[test]
+    fn dictation_backend_accepts_sherpa_onnx_without_changing_batch_engine() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[dictation]
+backend = "sherpa-onnx"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert_eq!(config.dictation.backend, "sherpa-onnx");
         assert_eq!(config.transcription.engine, "whisper");
     }
 

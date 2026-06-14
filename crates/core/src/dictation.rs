@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+const SHERPA_ONNX_DICTATION_FALLBACK_WARNING: &str =
+    "sherpa-onnx dictation failed; using whisper final text for this session";
+const SHERPA_ONNX_DOC_REF: &str = "docs/SHERPA_ONNX.md";
+
 // ── Model preload cache ──────────────────────────────────────
 //
 // The whisper model takes 1-15s to load depending on size and system load.
@@ -204,11 +208,15 @@ enum DictationFinalBackend {
     AppleSpeech,
     Parakeet,
     MlxAudio,
+    SherpaOnnx,
 }
 
 impl DictationFinalBackend {
     fn needs_utterance_samples(self) -> bool {
-        matches!(self, Self::AppleSpeech | Self::Parakeet | Self::MlxAudio)
+        matches!(
+            self,
+            Self::AppleSpeech | Self::Parakeet | Self::MlxAudio | Self::SherpaOnnx
+        )
     }
 }
 
@@ -361,7 +369,7 @@ where
             config.transcription.language.clone(),
             config.transcription.partial_max_secs,
         );
-        let final_backend = dictation_final_backend(config);
+        let mut final_backend = dictation_final_backend(config);
         let mut final_utterance_samples: Vec<f32> = Vec::new();
         let mut accumulated_results: Vec<DictationResult> = Vec::new();
         let mut was_speaking = false;
@@ -386,7 +394,7 @@ where
                     on_event(DictationEvent::Processing);
                     if let Some(sr) = finalize_dictation_transcription(
                         config,
-                        final_backend,
+                        &mut final_backend,
                         &final_utterance_samples,
                         &mut streaming,
                         &whisper_ctx,
@@ -414,7 +422,7 @@ where
                     on_event(DictationEvent::Processing);
                     if let Some(sr) = finalize_dictation_transcription(
                         config,
-                        final_backend,
+                        &mut final_backend,
                         &final_utterance_samples,
                         &mut streaming,
                         &whisper_ctx,
@@ -508,7 +516,7 @@ where
                     on_event(DictationEvent::Processing);
                     if let Some(sr) = finalize_dictation_transcription(
                         config,
-                        final_backend,
+                        &mut final_backend,
                         &final_utterance_samples,
                         &mut streaming,
                         &whisper_ctx,
@@ -535,7 +543,7 @@ where
                     on_event(DictationEvent::Processing);
                     if let Some(sr) = finalize_dictation_transcription(
                         config,
-                        final_backend,
+                        &mut final_backend,
                         &final_utterance_samples,
                         &mut streaming,
                         &whisper_ctx,
@@ -611,6 +619,7 @@ fn dictation_final_backend(config: &Config) -> DictationFinalBackend {
             }
         }
         "mlx-audio" => DictationFinalBackend::MlxAudio,
+        "sherpa-onnx" => DictationFinalBackend::SherpaOnnx,
         "whisper" => DictationFinalBackend::Whisper,
         other => {
             tracing::warn!(
@@ -670,13 +679,13 @@ fn parakeet_dictation_ready(config: &Config) -> bool {
 #[cfg(feature = "whisper")]
 fn finalize_dictation_transcription(
     _config: &Config,
-    _final_backend: DictationFinalBackend,
+    _final_backend: &mut DictationFinalBackend,
     _final_utterance_samples: &[f32],
     streaming: &mut StreamingWhisper,
     whisper_ctx: &whisper_rs::WhisperContext,
 ) -> Option<StreamingResult> {
     #[cfg(target_os = "macos")]
-    if _final_backend == DictationFinalBackend::AppleSpeech {
+    if *_final_backend == DictationFinalBackend::AppleSpeech {
         match transcribe_utterance_with_apple_speech(_final_utterance_samples, _config) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => {}
@@ -690,7 +699,7 @@ fn finalize_dictation_transcription(
     }
 
     #[cfg(feature = "parakeet")]
-    if _final_backend == DictationFinalBackend::Parakeet {
+    if *_final_backend == DictationFinalBackend::Parakeet {
         match transcribe_utterance_with_parakeet(_final_utterance_samples, _config) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => {}
@@ -703,7 +712,22 @@ fn finalize_dictation_transcription(
         }
     }
 
-    if _final_backend == DictationFinalBackend::MlxAudio {
+    if *_final_backend == DictationFinalBackend::SherpaOnnx {
+        match transcribe_utterance_with_sherpa_onnx(_final_utterance_samples, _config) {
+            Ok(Some(result)) => return Some(result),
+            Ok(None) => {}
+            Err(error) => {
+                *_final_backend = DictationFinalBackend::Whisper;
+                emit_sherpa_onnx_dictation_fallback_warning(&error.to_string());
+                tracing::warn!(
+                    error = %error,
+                    "sherpa-onnx dictation failed; using whisper fallback for this session"
+                );
+            }
+        }
+    }
+
+    if *_final_backend == DictationFinalBackend::MlxAudio {
         match transcribe_utterance_with_mlx_audio(_final_utterance_samples, _config) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => {}
@@ -721,6 +745,32 @@ fn finalize_dictation_transcription(
     }
 
     streaming.finalize(whisper_ctx)
+}
+
+fn emit_sherpa_onnx_dictation_fallback_warning(detail: &str) {
+    eprintln!(
+        "[minutes] {} (detail: {})",
+        SHERPA_ONNX_DICTATION_FALLBACK_WARNING, detail
+    );
+    tracing::warn!(
+        source = "dictation",
+        detail,
+        "{}",
+        SHERPA_ONNX_DICTATION_FALLBACK_WARNING
+    );
+    crate::logging::append_log(&serde_json::json!({
+        "ts": Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "dictation_sherpa_onnx_fallback",
+        "file": "",
+        "message": SHERPA_ONNX_DICTATION_FALLBACK_WARNING,
+        "extra": {
+            "source": "dictation",
+            "detail": detail,
+            "doc_ref": SHERPA_ONNX_DOC_REF,
+        }
+    }))
+    .ok();
 }
 
 #[cfg(target_os = "macos")]
@@ -802,6 +852,27 @@ fn transcribe_utterance_with_mlx_audio(
     config: &Config,
 ) -> Result<Option<StreamingResult>, MinutesError> {
     match crate::mlx_audio::transcribe_utterance(samples, config) {
+        Ok(Some(result)) => {
+            let Some(text) = normalize_final_dictation_text(&result.text) else {
+                return Ok(None);
+            };
+            Ok(Some(StreamingResult {
+                text,
+                is_final: true,
+                duration_secs: result.duration_secs,
+            }))
+        }
+        Ok(None) => Ok(None),
+        Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn transcribe_utterance_with_sherpa_onnx(
+    samples: &[f32],
+    config: &Config,
+) -> Result<Option<StreamingResult>, MinutesError> {
+    match crate::sherpa_onnx::transcribe_utterance(samples, config) {
         Ok(Some(result)) => {
             let Some(text) = normalize_final_dictation_text(&result.text) else {
                 return Ok(None);
@@ -1345,6 +1416,18 @@ mod tests {
         assert_eq!(
             dictation_final_backend(&config),
             DictationFinalBackend::MlxAudio
+        );
+        assert!(dictation_final_backend(&config).needs_utterance_samples());
+    }
+
+    #[test]
+    fn dictation_final_backend_selects_sherpa_onnx() {
+        let mut config = Config::default();
+        config.dictation.backend = "sherpa-onnx".into();
+
+        assert_eq!(
+            dictation_final_backend(&config),
+            DictationFinalBackend::SherpaOnnx
         );
         assert!(dictation_final_backend(&config).needs_utterance_samples());
     }
